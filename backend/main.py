@@ -18,7 +18,6 @@ class LoginRequest(BaseModel):
 class ScheduleRequest(BaseModel):
     cookies: dict
 
-# --- СЛОВАРЬ СПЕЦИАЛЬНОСТЕЙ ---
 SPECIALTY_MAP = {
     "международные отношения": "IR_timetable.pdf",
     "мировая экономика": "WE_timetable.pdf",
@@ -30,7 +29,6 @@ SPECIALTY_MAP = {
     "африканистика": "AF_timetable.pdf"
 }
 
-# --- ВХОД ---
 @app.post("/login")
 def login(data: LoginRequest):
     print(f"\n🔹 Вход пользователя: {data.username}")
@@ -73,7 +71,6 @@ def login(data: LoginRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ПОЛУЧЕНИЕ ДАННЫХ ---
 @app.post("/schedule")
 def get_data(data: ScheduleRequest):
     print("\n🔹 Запрос данных кабинета...")
@@ -93,7 +90,6 @@ def get_data(data: ScheduleRequest):
     }
 
     try:
-        # 1. НОВОСТИ
         print("   📰 Качаю новости...")
         r_news = session.get("https://student.bsu.by/PersonalCabinet/News", headers=headers)
         soup_news = BeautifulSoup(r_news.text, 'html.parser')
@@ -117,13 +113,11 @@ def get_data(data: ScheduleRequest):
                         response_data["news"].append({"title": title, "desc": desc, "link": full_link})
             except: continue
 
-        # 2. ФОТО
         print("   📸 Качаю фото...")
         r_photo = session.get("https://student.bsu.by/Photo/Photo.aspx", headers=headers)
         if r_photo.status_code == 200:
             response_data["photo_base64"] = base64.b64encode(r_photo.content).decode('utf-8')
 
-        # 3. КУРС, БАЛЛ, СПЕЦИАЛЬНОСТЬ
         print("   🎓 Анализирую профиль...")
         r_grade = session.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=headers)
         soup_grade = BeautifulSoup(r_grade.text, 'html.parser')
@@ -154,7 +148,6 @@ def get_data(data: ScheduleRequest):
                         pdf_filename = SPECIALTY_MAP[spec_name]
                         print(f"      ✅ Найдена специальность: {spec_name} -> {pdf_filename}")
 
-        # 4. РАСПИСАНИЕ
         print(f"   📅 Качаю PDF ({pdf_filename}, Курс {user_course})...")
         pdf_url = f"https://fir.bsu.by/images/timetable/{pdf_filename}"
         r_pdf = requests.get(pdf_url, verify=False)
@@ -168,11 +161,8 @@ def get_data(data: ScheduleRequest):
                     if page_num < len(doc):
                         page = doc.load_page(page_num)
                         
-                        # Matrix(1.5, 1.5) - баланс между качеством и скоростью
-                        # Чем меньше цифра, тем быстрее работает телефон
                         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5)) 
                         
-                        # ИСПРАВЛЕНИЕ ОШИБКИ: Просто "jpg" без лишних аргументов 
                         img_data = pix.tobytes("jpg") 
                         
                         b64_img = base64.b64encode(img_data).decode('utf-8')
