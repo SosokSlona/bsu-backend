@@ -67,21 +67,4 @@
 | 🤝 Конфликтология | `IC_timetable.pdf` |
 | 📦 Логистика | `ILOG_timetable.pdf` |
 
----
 
-## 🚀 Установка и запуск
-
-### 1. Запуск Сервера (Backend)
-
-```bash
-cd backend
-# Создание виртуального окружения
-python -m venv .venv
-source .venv/bin/activate  # MacOS/Linux
-# .venv\Scripts\activate   # Windows
-
-# Установка зависимостей
-pip install -r requirements.txt
-
-# Запуск
-python main.py
