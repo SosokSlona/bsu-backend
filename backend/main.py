@@ -4,22 +4,19 @@ import base64
 import requests
 import uvicorn
 import ddddocr
-import fitz  # PyMuPDF
+import fitz
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BSU_Backend")
 
 app = FastAPI()
 
-# Инициализация OCR (отключаем рекламу)
 ocr = ddddocr.DdddOcr(show_ad=False)
 
-# Карта специальностей ФМО
 SPECIALTY_MAP = {
     "международные отношения": "IR_timetable.pdf",
     "мировая экономика": "WE_timetable.pdf",
@@ -60,14 +57,14 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
     res = {"mark": "", "color_type": "neutral"}
     exam = None
     credit = None
-    
+
     for c in cols:
         cls = safe_get_attr(c, "class")
         if "styleExamBody" in cls:
             exam = c
         if "styleZachBody" in cls:
             credit = c
-    
+
     if exam:
         txt = clean_text(exam.get_text()) or safe_get_attr(exam, "title")
         m = re.search(r'^(\d+)', txt)
@@ -92,7 +89,7 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
             res["color_type"] = "bad"
         elif "осв" in txt:
             res["mark"] = "ОСВ"
-            
+
     return res
 
 def process_pdf(content: bytes, course: int) -> List[str]:
@@ -101,27 +98,21 @@ def process_pdf(content: bytes, course: int) -> List[str]:
         with fitz.open(stream=content, filetype="pdf") as doc:
             total = len(doc)
             start, end = 0, total
-            
-            # --- ПАТЧ 1: ЖЕСТКО 2 СТРАНИЦЫ НА КУРС ---
-            # 1 курс: стр 0, 1
-            # 2 курс: стр 2, 3
-            # и т.д.
+
             if 0 < course < 6:
                 start = (course - 1) * 2
-                end = start + 2 
-                
-                # Защита, если страниц меньше чем ожидалось
+                end = start + 2
+
                 if start >= total:
                     start, end = 0, total
                 else:
                     end = min(end, total)
-            
-            # Если документ совсем маленький, берем всё
+
             if total <= 2:
                 start, end = 0, total
 
             for i in range(start, end):
-                # Matrix 3x для качества
+
                 pix = doc[i].get_pixmap(matrix=fitz.Matrix(3, 3))
                 imgs.append(base64.b64encode(pix.tobytes("jpg")).decode('utf-8'))
     except Exception as e:
@@ -131,15 +122,15 @@ def process_pdf(content: bytes, course: int) -> List[str]:
 def get_fir_pdf(spec_name: str, course: int) -> List[str]:
     filename = ""
     spec_lower = spec_name.lower()
-    
+
     for key, val in SPECIALTY_MAP.items():
         if key in spec_lower:
             filename = val
             break
-    
+
     if not filename:
         return []
-    
+
     try:
         url = f"https://fir.bsu.by/images/timetable/{filename}"
         r = requests.get(url, verify=False, timeout=10)
@@ -155,27 +146,27 @@ def login(data: LoginRequest):
     try:
         r1 = s.get("https://student.bsu.by/login.aspx", headers=HEADERS)
         soup = BeautifulSoup(r1.text, 'html.parser')
-        
+
         payload: Dict[str, str] = {}
         for i in soup.find_all('input', type='hidden'):
             name = i.get('name')
             value = i.get('value', '')
             if name:
                 payload[str(name)] = str(value)
-        
+
         r_cap = s.get("https://student.bsu.by/Captcha/CaptchaImage.aspx", headers=HEADERS)
         code = ocr.classification(r_cap.content)
-        
+
         payload['ctl00$ContentPlaceHolder0$txtUserLogin'] = data.username
         payload['ctl00$ContentPlaceHolder0$txtUserPassword'] = data.password
         payload['ctl00$ContentPlaceHolder0$txtCapture'] = str(code)
         payload['ctl00$ContentPlaceHolder0$btnLogon'] = 'Войти'
-        
+
         r2 = s.post("https://student.bsu.by/login.aspx", data=payload, headers=HEADERS, allow_redirects=False)
-        
+
         if r2.status_code == 302:
             return {"status": "ok", "cookies": s.cookies.get_dict()}
-        
+
         raise HTTPException(401, "Ошибка входа. Возможно, неверная капча или пароль.")
     except HTTPException as he:
         raise he
@@ -187,15 +178,15 @@ def login(data: LoginRequest):
 def get_data(data: ScheduleRequest):
     s = requests.Session()
     s.cookies.update(data.cookies)
-    
+
     resp: Dict[str, Any] = {
-        "fio": "Не найдено", 
-        "current_session": "", 
-        "subjects": [], 
-        "schedule_images": [], 
-        "photo_base64": None, 
-        "average_grade": "-", 
-        "specialty": "", 
+        "fio": "Не найдено",
+        "current_session": "",
+        "subjects": [],
+        "schedule_images": [],
+        "photo_base64": None,
+        "average_grade": "-",
+        "specialty": "",
         "news": []
     }
     course = 0
@@ -204,10 +195,9 @@ def get_data(data: ScheduleRequest):
         r = s.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=HEADERS)
         if "login.aspx" in r.url:
             raise HTTPException(401, "Session expired")
-            
+
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        # 1. Основная инфа
         fio = soup.find("span", id=re.compile(r"lbFIO1$"))
         if fio: resp["fio"] = clean_text(fio.text)
 
@@ -221,7 +211,7 @@ def get_data(data: ScheduleRequest):
             txt = clean_text(kurs.text)
             cm = re.search(r'(\d+)\s*курс', txt)
             if cm: course = int(cm.group(1))
-            
+
             if "специальность:" in txt.lower():
                 parts = txt.lower().split("специальность:")
                 if len(parts) > 1:
@@ -236,33 +226,30 @@ def get_data(data: ScheduleRequest):
                     resp["photo_base64"] = base64.b64encode(ri.content).decode('utf-8')
             except: pass
 
-        # 2. Таблица успеваемости
         table = None
         for t in soup.find_all("table"):
             if "№ п/п" in t.text:
                 table = t
                 break
-        
+
         if table:
             first_row = table.find("tr")
-            if first_row: 
+            if first_row:
                 resp["current_session"] = clean_text(first_row.text)
-            
+
             for row in table.find_all("tr"):
                 name_cell = row.find("td", class_=re.compile("styleLesson"))
-                
+
                 if name_cell:
                     raw_nm = name_cell.get_text(separator=" ", strip=True)
                     nm = clean_text(raw_nm).replace("Дисциплины по выбору студента:", "").strip()
-                    
-                    # --- ПАТЧ 2: ФИЛЬТРАЦИЯ ПУСТЫХ СТРОК ---
-                    # Если название содержит "Предмет" или оно короче 3 символов -> пропускаем
+
                     if not nm or len(nm) < 3 or "предмет" in nm.lower() or "название дисциплины" in nm.lower():
                         continue
 
                     cols = row.find_all("td")
                     grade = parse_grade(cols)
-                    
+
                     hm = {}
                     titles = ["lectures", "practice", "labs", "seminars", "electives", "ksr"]
                     ti = 0
@@ -270,18 +257,17 @@ def get_data(data: ScheduleRequest):
                         if "styleHours" in safe_get_attr(c, "class"):
                             if ti < len(titles):
                                 v = clean_text(c.text)
-                                if v.isdigit(): 
+                                if v.isdigit():
                                     hm[titles[ti]] = int(v)
                             ti += 1
-                            
+
                     resp["subjects"].append({
-                        "name": nm, 
-                        "hours": hm, 
-                        "mark": grade["mark"], 
+                        "name": nm,
+                        "hours": hm,
+                        "mark": grade["mark"],
                         "color": grade["color_type"]
                     })
 
-        # 3. Расписание
         pdf_found = False
         for a in soup.find_all("a", href=True):
             href_val = str(a.get('href', ''))
@@ -294,11 +280,10 @@ def get_data(data: ScheduleRequest):
                         pdf_found = True
                         break
                 except: pass
-        
+
         if not pdf_found and resp["specialty"]:
             resp["schedule_images"] = get_fir_pdf(str(resp["specialty"]), course)
 
-        # 4. Новости
         try:
             rn = s.get("https://student.bsu.by/PersonalCabinet/News", headers=HEADERS)
             sn = BeautifulSoup(rn.text, 'html.parser')

@@ -6,7 +6,7 @@ import uvicorn
 from bs4 import BeautifulSoup
 import base64
 import re
-import fitz  
+import fitz
 
 app = FastAPI()
 ocr = ddddocr.DdddOcr(show_ad=False)
@@ -37,7 +37,7 @@ def login(data: LoginRequest):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://student.bsu.by/login.aspx"
     }
-    
+
     try:
         r_page = session.get("https://student.bsu.by/login.aspx", headers=headers)
         soup = BeautifulSoup(r_page.text, 'html.parser')
@@ -49,7 +49,7 @@ def login(data: LoginRequest):
         print("   🤖 Решаю капчу...")
         r_captcha = session.get("https://student.bsu.by/Captcha/CaptchaImage.aspx", headers=headers)
         captcha_code = ocr.classification(r_captcha.content)
-        
+
         payload.update({
             'ctl00$ContentPlaceHolder0$txtUserLogin': data.username,
             'ctl00$ContentPlaceHolder0$txtUserPassword': data.password,
@@ -69,7 +69,6 @@ def login(data: LoginRequest):
     except Exception as e:
         print(f"🔥 Ошибка: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/schedule")
 def get_data(data: ScheduleRequest):
@@ -121,9 +120,9 @@ def get_data(data: ScheduleRequest):
         print("   🎓 Анализирую профиль...")
         r_grade = session.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=headers)
         soup_grade = BeautifulSoup(r_grade.text, 'html.parser')
-        
+
         grade_span = soup_grade.find("span", id=lambda x: x and x.endswith("lbStudBall"))
-        if grade_span: 
+        if grade_span:
             text = grade_span.text.strip()
             response_data["grade_text"] = " ".join(text.split())
             match = re.search(r'(\d+[\.,]\d+)', text)
@@ -151,20 +150,20 @@ def get_data(data: ScheduleRequest):
         print(f"   📅 Качаю PDF ({pdf_filename}, Курс {user_course})...")
         pdf_url = f"https://fir.bsu.by/images/timetable/{pdf_filename}"
         r_pdf = requests.get(pdf_url, verify=False)
-        
+
         if r_pdf.status_code == 200:
             with fitz.open(stream=r_pdf.content, filetype="pdf") as doc:
                 start_page = (user_course - 1) * 2
                 pages_to_read = [start_page, start_page + 1]
-                
+
                 for page_num in pages_to_read:
                     if page_num < len(doc):
                         page = doc.load_page(page_num)
-                        
-                        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5)) 
-                        
-                        img_data = pix.tobytes("jpg") 
-                        
+
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+
+                        img_data = pix.tobytes("jpg")
+
                         b64_img = base64.b64encode(img_data).decode('utf-8')
                         response_data["schedule_images"].append(b64_img)
         else:
