@@ -25,7 +25,9 @@ PROXIES = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
 SPECIALTY_MAP = {
@@ -60,7 +62,6 @@ def safe_get_attr(element: Any, attr: str) -> str:
     return " ".join(val) if isinstance(val, list) else str(val) if val else ""
 
 def parse_grade(cols: List[Any]) -> Dict[str, str]:
-    """Умный парсинг оценок."""
     res = {"mark": "", "color_type": "neutral"}
     exam_cell = None
     credit_cell = None
@@ -74,20 +75,21 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
     if exam_cell:
         txt = clean_text(exam_cell.get_text()) or safe_get_attr(exam_cell, "title")
         if txt:
-            # Ищем цифру в начале (напр. "9 (девять)")
+            # Ищем цифру
             m = re.search(r'^(\d+)', txt)
             if m:
                 res["mark"] = m.group(1)
                 try:
                     v = int(res["mark"])
+                    # Схема БГЭУ/БГУ (стипендия с 6.0)
                     if v < 4: res["color_type"] = "bad"
-                    elif v < 6: res["color_type"] = "bad"     # 4-5: Красный
-                    elif v < 7: res["color_type"] = "neutral" # 6: Желтый
-                    elif v < 9: res["color_type"] = "neutral" # 7-8: Желтоватый (логику цветов можно править тут)
-                    else: res["color_type"] = "good"          # 9-10: Зеленый
+                    elif v < 6: res["color_type"] = "bad"     # 4-5: Красный (без стипендии)
+                    elif v < 7: res["color_type"] = "neutral" # 6: Желтый (обычная)
+                    elif v < 9: res["color_type"] = "good"    # 7-8: Зеленоватый (+%)
+                    else: res["color_type"] = "excellent"     # 9-10: Ярко-зеленый (макс)
                 except: pass
             else:
-                # Если цифры нет, берем текст (напр. "неявка")
+                # Если текст (напр. "неявка")
                 res["mark"] = txt[:15]
             return res
 
@@ -105,8 +107,8 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
             elif "осв" in txt_lower:
                 res["mark"] = "ОСВ"
             else:
-                # [FIX 1] Нестандартные оценки: выводим как есть
-                res["mark"] = txt.capitalize()[:20] 
+                # Нестандартные оценки: выводим как есть
+                res["mark"] = txt.capitalize()[:25]
                 
     return res
 
@@ -145,7 +147,7 @@ def get_fir_pdf(spec_name: str, course: int) -> List[str]:
 
 @app.post("/login")
 def login(data: LoginRequest):
-    # [FIX 2] Авто-ретрай (3 попытки) при входе
+    # Авто-ретрай
     for attempt in range(3):
         logger.info(f"Login attempt {attempt + 1}")
         s = requests.Session()
@@ -155,52 +157,76 @@ def login(data: LoginRequest):
             r1 = s.get("https://student.bsu.by/login.aspx", headers=HEADERS, timeout=15)
             soup = BeautifulSoup(r1.text, 'html.parser')
             
+            # Собираем скрытые поля
             viewstate = soup.find("input", {"id": "__VIEWSTATE"})
             eventval = soup.find("input", {"id": "__EVENTVALIDATION"})
             
             if not viewstate or not eventval:
-                logger.warning("No ViewState found on login page")
+                logger.warning("No ViewState found.")
                 continue
 
-            img = soup.find("img", {"id": re.compile("CaptchaImage")})
-            if not img: raise Exception("No captcha")
+            # --- ПОИСК КАПЧИ ПО ТВОЕМУ HTML ---
+            # Ищем внутри <td> с конкретным ID из твоего файла
+            img = None
+            td_captcha = soup.find("td", {"id": "ctl00_ContentPlaceHolder0_TableCell1"})
+            if td_captcha:
+                img = td_captcha.find("img")
             
-            cap_url = "https://student.bsu.by" + img['src']
-            cap_res = s.get(cap_url, headers=HEADERS)
-            code = ocr.classification(cap_res.content)
+            if not img:
+                # Резервный поиск
+                img = soup.find("img", src=re.compile("Captcha", re.I))
             
+            if not img: raise Exception("Captcha not found")
+            
+            # Формируем ссылку на картинку
+            src = img['src']
+            if not src.startswith("http"):
+                src = "https://student.bsu.by" + src if src.startswith("/") else "https://student.bsu.by/" + src
+                
+            # Качаем и разгадываем
+            cap_res = s.get(src, headers=HEADERS)
+            raw_code = ocr.classification(cap_res.content)
+            code = re.sub(r'\D', '', raw_code.lower().replace('o', '0').replace('l', '1').replace('z', '2'))
+            
+            logger.info(f"Solved code: {code} (raw: {raw_code})")
+            
+            # --- ПРАВИЛЬНЫЙ PAYLOAD (ИЗ ТВОЕГО HTML) ---
             payload = {
                 "__VIEWSTATE": viewstate.get("value", ""),
                 "__EVENTVALIDATION": eventval.get("value", ""),
-                "ctl00$MainContent$Username": data.username,
-                "ctl00$MainContent$Password": data.password,
-                "ctl00$MainContent$CaptchaCode": code,
-                "ctl00$MainContent$LoginButton": "Войти"
+                # ВОТ ОНИ, ПРАВИЛЬНЫЕ ИМЕНА ПОЛЕЙ:
+                "ctl00$ContentPlaceHolder0$txtUserLogin": data.username,
+                "ctl00$ContentPlaceHolder0$txtUserPassword": data.password,
+                "ctl00$ContentPlaceHolder0$txtCapture": code,
+                "ctl00$ContentPlaceHolder0$btnLogon": "Войти"
             }
             
-            r2 = s.post("https://student.bsu.by/login.aspx", data=payload, headers=HEADERS, allow_redirects=False)
+            # Заголовки для имитации браузера
+            post_headers = HEADERS.copy()
+            post_headers["Origin"] = "https://student.bsu.by"
+            post_headers["Referer"] = "https://student.bsu.by/login.aspx"
             
-            # Успешный вход = редирект или наличие кнопки выхода
+            r2 = s.post("https://student.bsu.by/login.aspx", data=payload, headers=post_headers, allow_redirects=False)
+            
+            # Проверка входа
             if r2.status_code == 302 or "Logout.aspx" in r2.text:
                 return {"status": "ok", "cookies": s.cookies.get_dict()}
             
         except Exception as e:
-            logger.error(f"Attempt {attempt} failed: {e}")
-            time.sleep(1) # Пауза перед ретраем
+            logger.error(f"Attempt {attempt} error: {e}")
+            time.sleep(1)
             
-    raise HTTPException(401, "Ошибка входа. Проверьте логин/пароль.")
+    raise HTTPException(401, "Login failed. Check credentials.")
 
 @app.post("/schedule")
 def get_data(data: ScheduleRequest):
-    # [FIX 2] Ретрай для получения данных (защита от разрывов сети)
     for attempt in range(2):
         try:
             return _get_data_internal(data)
-        except HTTPException as he:
-            raise he # Сразу пробрасываем 401
+        except HTTPException as he: raise he
         except Exception as e:
-            logger.error(f"Schedule attempt {attempt} failed: {e}")
-            if attempt == 1: raise HTTPException(500, "Ошибка связи с БГУ")
+            logger.error(f"Schedule error: {e}")
+            if attempt == 1: raise HTTPException(500, "BSU connection error")
             time.sleep(1)
 
 def _get_data_internal(data: ScheduleRequest):
@@ -209,29 +235,23 @@ def _get_data_internal(data: ScheduleRequest):
     s.cookies.update(data.cookies)
     
     resp = {
-        "fio": "Не найдено", 
-        "current_session": "", 
-        "subjects": [], 
-        "schedule_images": [], 
-        "photo_base64": None, 
-        "average_grade": "-", 
-        "specialty": "", 
-        "news": [],
-        "semesters": [], 
-        "current_semester_id": ""
+        "fio": "Загрузка...", "current_session": "", "subjects": [], 
+        "schedule_images": [], "photo_base64": None, "average_grade": "-", 
+        "specialty": "", "news": [], "semesters": [], "current_semester_id": ""
     }
     course = 0
 
     url = "https://student.bsu.by/PersonalCabinet/StudProgress"
     r = s.get(url, headers=HEADERS, timeout=15)
     
-    # [FIX: CRITICAL] Если редирект на логин - сразу 401
-    if "login.aspx" in r.url.lower() or "login.aspx" in r.text.lower(): 
+    # Если выкинуло на логин
+    if "login.aspx" in r.url.lower(): 
         raise HTTPException(401, "Session expired")
         
     soup = BeautifulSoup(r.text, 'html.parser')
 
-    # [FIX 3] Обработка переключения семестров
+    # Парсинг семестров
+    # Ищем селектор семестра (имя может отличаться, ищем по смыслу)
     sem_select = soup.find("select", id=re.compile("ddlSemestr")) or soup.find("select", id=re.compile("ddlKurs"))
     if sem_select:
         for opt in sem_select.find_all("option"):
@@ -242,52 +262,42 @@ def _get_data_internal(data: ScheduleRequest):
             })
             if opt.get("selected"): resp["current_semester_id"] = opt.get("value")
 
-    # Если попросили другой семестр
+    # Смена семестра
     if data.period_id and sem_select and data.period_id != resp["current_semester_id"]:
         try:
-            vs = soup.find("input", {"id": "__VIEWSTATE"}).get("value", "")
-            ev = soup.find("input", {"id": "__EVENTVALIDATION"}).get("value", "")
-            sel_name = sem_select.get("name")
+            payload = {}
+            for inp in soup.find_all("input", type="hidden"):
+                payload[inp.get("name")] = inp.get("value", "")
             
-            payload = {
-                "__VIEWSTATE": vs,
-                "__EVENTVALIDATION": ev,
-                "__EVENTTARGET": sel_name,
-                sel_name: data.period_id
-            }
-            r_switch = s.post(url, data=payload, headers=HEADERS)
-            soup = BeautifulSoup(r_switch.text, 'html.parser')
+            payload["__EVENTTARGET"] = sem_select.get("name")
+            payload[sem_select.get("name")] = data.period_id
+            
+            r = s.post(url, data=payload, headers=HEADERS)
+            soup = BeautifulSoup(r.text, 'html.parser')
             resp["current_semester_id"] = data.period_id
         except: pass
 
-    # 1. ФИО - Главный маркер валидности страницы
+    # ФИО
     fio_tag = soup.find("span", id=re.compile(r"lbFIO1$"))
-    if fio_tag:
-        resp["fio"] = clean_text(fio_tag.text)
-    else:
-        # [FIX: CRITICAL] Если на странице нет ФИО, значит это не ЛК.
-        # Это предотвращает "Ничего не найдено".
-        raise HTTPException(401, "Invalid session (FIO not found)")
+    if fio_tag: resp["fio"] = clean_text(fio_tag.text)
+    else: raise HTTPException(401, "Invalid session (No FIO)")
 
-    # 2. Балл
+    # Остальные данные
     ball = soup.find("span", id=re.compile(r"lbStudBall$"))
     if ball:
         m = re.search(r'(\d+[,.]\d+)', ball.text)
         if m: resp["average_grade"] = m.group(1).replace(",", ".")
 
-    # 3. Курс
     kurs = soup.find("span", id=re.compile(r"lbStudKurs$"))
     if kurs:
         txt = clean_text(kurs.text)
         cm = re.search(r'(\d+)\s*курс', txt)
         if cm: course = int(cm.group(1))
-        
         if "специальность:" in txt.lower():
             resp["specialty"] = txt.lower().split("специальность:")[1].split(",")[0].strip().capitalize()
         else:
             resp["specialty"] = txt
 
-    # 4. Фото
     if soup.find("img", id=re.compile(r"imgStudPhoto$")):
         try:
             ri = s.get("https://student.bsu.by/Photo/Photo.aspx", headers=HEADERS)
@@ -295,7 +305,7 @@ def _get_data_internal(data: ScheduleRequest):
                 resp["photo_base64"] = base64.b64encode(ri.content).decode('utf-8')
         except: pass
 
-    # 5. Таблица
+    # Таблица с оценками
     table = None
     for t in soup.find_all("table"):
         if "№ п/п" in t.text:
@@ -308,13 +318,12 @@ def _get_data_internal(data: ScheduleRequest):
             name_cell = row.find("td", class_=re.compile("styleLesson"))
             if name_cell:
                 nm = clean_text(name_cell.get_text(separator=" ")).replace("Дисциплины по выбору студента:", "").strip()
-                if len(nm) < 3 or "предмет" in nm.lower(): continue
+                if len(nm) < 3 or "предмет" in nm.lower() or "название дисциплины" in nm.lower(): continue
                 
                 cols = row.find_all("td")
                 grade = parse_grade(cols)
                 
                 hm = {}
-                # Логика часов (упрощенно)
                 titles = ["lectures", "practice", "labs", "seminars", "electives", "ksr"]
                 ti = 0
                 for c in cols:
@@ -327,7 +336,7 @@ def _get_data_internal(data: ScheduleRequest):
                     "name": nm, "hours": hm, "mark": grade["mark"], "color": grade["color_type"]
                 })
 
-    # 6. Расписание
+    # Расписание (PDF)
     pdf_found = False
     for a in soup.find_all("a", href=True):
         href = str(a.get('href', ''))
@@ -344,7 +353,7 @@ def _get_data_internal(data: ScheduleRequest):
     if not pdf_found and resp["specialty"]:
         resp["schedule_images"] = get_fir_pdf(str(resp["specialty"]), course)
 
-    # 7. Новости
+    # Новости
     try:
         rn = s.get("https://student.bsu.by/PersonalCabinet/News", headers=HEADERS)
         sn = BeautifulSoup(rn.text, 'html.parser')
