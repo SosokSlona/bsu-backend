@@ -7,18 +7,19 @@ from models import ParsedScheduleResponse, DaySchedule, LessonItem
 # --- РЕГУЛЯРКИ ---
 TIME_PATTERN = re.compile(r'(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})')
 ROOM_PATTERN = re.compile(r'\b(\d{3,4}[а-я]?|с/з|с/к|ауд\.?)\b', re.IGNORECASE)
-TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?)\)', re.IGNORECASE)
+# Добавили (ф) в типы
+TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?|ф)\)', re.IGNORECASE)
 TEACHER_PATTERN = re.compile(r'([A-ЯЁ][а-яё]+(?:\s+[A-ЯЁ]\.){1,2})')
 
-# СЛОВАРЬ ДЛЯ ДЕШИФРОВКИ (чтобы узнавать перевернутые слова)
+# СЛОВАРЬ ДЛЯ ДЕШИФРОВКИ
 VOCABULARY = {
     'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье',
     'время', 'день', 'лекция', 'семинар', 'практика', 'англ', 'нем', 'исп', 'фран',
     'язык', 'группа', 'курс', 'специальность', 'иностранный'
 }
 
-# Слова-паразиты для названий групп
-IGNORE_HEADERS = {'день', 'дни', 'время', 'часы', 'час', '№', 'п/п', 'предмет', 'специальность', 'курс', 'группа'}
+# Стоп-слова для колонок
+IGNORE_HEADERS = {'день', 'дни', 'время', 'часы', 'час', '№', 'п/п', 'предмет', 'специальность', 'курс', 'код', 'название'}
 
 def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
     schedule_by_group: Dict[str, Dict[str, List[LessonItem]]] = {}
@@ -28,15 +29,21 @@ def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
     
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         pages = []
-        # Берем страницы с запасом, если вдруг верстка съехала
         max_idx = min(start_page + 2, len(pdf.pages))
         for i in range(start_page, max_idx):
             pages.append(pdf.pages[i])
         if not pages: pages = pdf.pages
 
         for page in pages:
-            # layout=True помогает при разреженном тексте (к и н ь...)
-            table = page.extract_table({
+            # 1. ОБРЕЗАНИЕ ШАПКИ (CROP)
+            # Отрезаем верхние 12% страницы, где обычно написана специальность и коды
+            width = page.width
+            height = page.height
+            # Оставляем область: (x0, top=12%, x1, bottom)
+            cropped_page = page.crop((0, height * 0.12, width, height))
+            
+            # Извлекаем таблицу из обрезанной страницы
+            table = cropped_page.extract_table({
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
                 "snap_tolerance": 4,
@@ -45,42 +52,51 @@ def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
             
             if not table or len(table) < 2: continue
 
-            # 1. АНАЛИЗ КОЛОНОК (Сначала лечим текст, потом определяем роль)
+            # 2. АНАЛИЗ КОЛОНОК
             day_col, time_col, group_cols = _analyze_column_roles(table)
             
             if time_col is None or not group_cols: continue
 
-            # 2. ОПРЕДЕЛЯЕМ НАЗВАНИЯ ГРУПП
+            # 3. ОПРЕДЕЛЕНИЕ НАЗВАНИЙ ГРУПП
             group_names_map = {}
-            # Ищем название в первых 3 строках
             for g_idx in group_cols:
+                # Проверяем, есть ли вообще данные в этой колонке (защита от фантомов)
+                if not _is_valid_group_column(table, g_idx):
+                    continue
+
                 g_name = ""
-                for r_idx in range(3): 
-                    if r_idx < len(table):
-                        candidate = _aggressive_fix_text(table[r_idx][g_idx])
-                        if len(candidate) > 2 and candidate.lower() not in IGNORE_HEADERS:
-                            g_name = candidate
-                            break
+                # Ищем имя в первых строках таблицы
+                for r_idx in range(min(3, len(table))): 
+                    val = _aggressive_fix_text(table[r_idx][g_idx])
+                    if len(val) > 2 and val.lower() not in IGNORE_HEADERS:
+                        # Фильтр: если имя похоже на "6-05-..." (код специальности), пропускаем
+                        if re.match(r'\d-\d+', val): continue
+                        g_name = val
+                        break
                 
-                # Если название пустое или похоже на "День" (из-за ошибки), даем дефолт
+                # Дефолтное имя
                 if not g_name or g_name.lower() in VOCABULARY:
-                    g_name = f"Группа {g_idx+1}"
+                    g_name = f"Группа {g_idx}" # Используем индекс как временное имя
                 
                 group_names_map[g_idx] = g_name
                 if g_name not in schedule_by_group:
                     schedule_by_group[g_name] = {}
 
-            # 3. ПАРСИНГ СТРОК
+            # 4. ПАРСИНГ СТРОК
             current_day = "Понедельник"
             
-            for row in table[1:]:
+            for row in table:
+                # Пропускаем совсем пустые строки
+                if not any(row): continue
+
                 # А. День
-                if day_col is not None:
+                if day_col is not None and day_col < len(row):
                     d_raw = _aggressive_fix_text(row[day_col])
                     if d_raw.lower() in VOCABULARY and len(d_raw) > 3:
                         current_day = d_raw.capitalize()
 
                 # Б. Время
+                if time_col >= len(row): continue
                 t_raw = _aggressive_fix_text(row[time_col])
                 t_match = TIME_PATTERN.search(t_raw)
                 if not t_match: continue
@@ -97,17 +113,18 @@ def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
                     # Логика "Look Left" (Общая лекция)
                     if not cell_text:
                         for scan in range(time_col + 1, g_idx):
+                            if scan >= len(row): break
                             neighbor = row[scan]
                             if neighbor:
                                 n_fixed = _aggressive_fix_text(neighbor)
                                 if "лек" in n_fixed.lower() or "общ" in n_fixed.lower():
-                                    cell_text = neighbor # Берем оригинал, починим внутри
+                                    cell_text = neighbor
                                     break
                     
                     fixed_text = _aggressive_fix_text(cell_text)
                     if len(fixed_text) < 3: continue
 
-                    # Разбиваем на подгруппы
+                    # Парсинг
                     lessons = _parse_and_split_cell(fixed_text)
                     
                     if current_day not in schedule_by_group[g_name]:
@@ -118,57 +135,63 @@ def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
                         l.time_end = t_end
                         schedule_by_group[g_name][current_day].append(l)
 
-    # 4. СБОРКА
+    # 5. СБОРКА И ОЧИСТКА ПУСТЫХ ГРУПП
     final_output = {}
     for g_name, days in schedule_by_group.items():
-        # Фильтруем пустые дни
+        # Если в группе нет уроков - не отдаем её
         if not days: continue
+        
+        # Если имя группы всё ещё "Группа X", пробуем переименовать её в нормальный порядковый номер
+        final_name = g_name
+        if g_name.startswith("Группа "):
+             # Это просто заглушка, оставим как есть, или можно сгенерировать красивее
+             pass
+
         week = []
         for d_name, lessons in days.items():
             week.append(DaySchedule(day_name=d_name, lessons=lessons))
-        final_output[g_name] = week
+        final_output[final_name] = week
 
     return ParsedScheduleResponse(groups=final_output)
 
+def _is_valid_group_column(table, col_idx):
+    """Проверяет, есть ли в колонке полезная нагрузка (не пустая ли она)"""
+    content_count = 0
+    total_checked = 0
+    for row in table[1:]: # Пропускаем шапку
+        if col_idx < len(row):
+            txt = row[col_idx]
+            if txt and len(txt.strip()) > 3:
+                content_count += 1
+        total_checked += 1
+    
+    # Если за всю страницу меньше 2 ячеек с текстом - это фантомная колонка
+    if content_count < 2: return False
+    return True
+
 def _aggressive_fix_text(text: Optional[str]) -> str:
-    """
-    Мощный дешифратор текста.
-    Чинит: "к и н ь л е д е н о П" -> "Понедельник"
-    Чинит: "г р е в т е Ч" -> "Четверг"
-    """
     if not text: return ""
-    # 1. Базовая чистка
     clean = text.replace('\n', ' ').strip()
     if not clean: return ""
 
-    # 2. Если текст читается нормально - возвращаем
-    if any(word in clean.lower() for word in ['понедельник', 'лекция', 'язык', 'группа']):
-        return clean
+    # Дешифратор перевертышей
+    if any(word in clean.lower() for word in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']):
+        return clean.capitalize()
 
-    # 3. Пробуем убрать пробелы и перевернуть
-    # "к и н ь л е д е н о П" -> "киньледеноП" -> "Понедельник"
     no_spaces = clean.replace(' ', '')
-    reversed_text = no_spaces[::-1]
-    
-    # Проверяем по словарю
-    reversed_lower = reversed_text.lower()
-    for word in VOCABULARY:
-        if word in reversed_lower:
-            # Если нашли совпадение, значит это был перевертыш
-            # Но нам нужно вернуть красивый регистр
-            # Если это день недели, возвращаем с большой буквы
-            if word in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
-                return word.capitalize()
-            return reversed_text # Иначе возвращаем как есть (например "Англ")
-
-    # 4. Если это не словарь, но похоже на перевертыш (Начинается с маленькой, кончается Большой)
     if len(no_spaces) > 3 and no_spaces[-1].isupper() and no_spaces[0].islower():
-        return reversed_text
+        reversed_text = no_spaces[::-1]
+        rev_lower = reversed_text.lower()
+        for w in VOCABULARY:
+            if w in rev_lower:
+                if w in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
+                    return w.capitalize()
+                return reversed_text
+        return reversed_text # Рискнем вернуть перевернутое, если похоже на структуру
 
     return clean
 
 def _analyze_column_roles(table: List[List[str]]) -> Tuple[Optional[int], Optional[int], List[int]]:
-    """Определяет роли колонок, предварительно исправляя текст"""
     day_idx = None
     time_idx = None
     group_indices = []
@@ -178,14 +201,12 @@ def _analyze_column_roles(table: List[List[str]]) -> Tuple[Optional[int], Option
     
     for col in range(num_cols):
         col_content = []
-        # Смотрим первые 30 строк
-        for row in table[:30]:
+        # Сканируем всю таблицу
+        for row in table:
             if col < len(row):
-                # ВАЖНО: Лечим текст перед анализом!
                 txt = _aggressive_fix_text(row[col]).lower()
                 if txt: col_content.append(txt)
         
-        # Анализируем содержимое
         days_score = sum(1 for x in col_content if x in VOCABULARY and x in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'])
         time_score = sum(1 for x in col_content if TIME_PATTERN.search(x))
         
@@ -194,32 +215,61 @@ def _analyze_column_roles(table: List[List[str]]) -> Tuple[Optional[int], Option
         elif time_score >= 2 and time_idx is None:
             time_idx = col
         else:
-            # Проверяем, не заголовок ли это
-            header_candidate = col_content[0] if col_content else ""
-            if header_candidate not in IGNORE_HEADERS:
+            # Кандидат в группы. Проверяем, что это не мусор
+            header = col_content[0] if col_content else ""
+            if header not in IGNORE_HEADERS:
                 group_indices.append(col)
     
-    # Корректировка: Если "Четверг" попал в группы, убираем его
     if day_idx in group_indices: group_indices.remove(day_idx)
     if time_idx in group_indices: group_indices.remove(time_idx)
     
     return day_idx, time_idx, group_indices
 
 def _clean_subject_garbage(text: str) -> str:
-    """Удаляет огрызки типа '- . ,' после вырезания преподов"""
-    # Убираем множественные пробелы
+    """Удаляет огрызки типа '- . ,'"""
+    # Удаляем множественные пробелы
     text = re.sub(r'\s+', ' ', text)
-    # Убираем знаки препинания в начале и конце
+    # Удаляем тире и точки В НАЧАЛЕ и КОНЦЕ
+    # Также удаляем типичные разделители внутри, если они висят
     text = text.strip(" .,-–/\\|")
-    # Убираем висячие скобки "()"
     text = text.replace("()", "")
-    # Убираем "(ф)" (частый мусор от "факультатив" или формы обучения)
-    text = text.replace("(ф)", "")
     return text.strip()
+
+def _extract_single_lesson(text: str) -> LessonItem:
+    # 1. Тип
+    l_type = "Прак"
+    tm = TYPE_PATTERN.search(text)
+    if tm:
+        val = tm.group(1).lower()
+        if "лек" in val: l_type = "Лекция"
+        elif "сем" in val: l_type = "Семинар"
+        elif "лаб" in val: l_type = "Лаба"
+        elif "экз" in val: l_type = "Экзамен"
+        elif "ф" in val: l_type = "Факультатив" # Новое!
+        text = text.replace(tm.group(0), "")
+
+    # 2. Аудитория (ищем в конце или отдельно стоящую)
+    room = ""
+    rm = ROOM_PATTERN.search(text)
+    if rm:
+        room = rm.group(1)
+        text = text.replace(room, "")
+
+    # 3. Преподаватель
+    teacher = ""
+    tcm = TEACHER_PATTERN.search(text)
+    if tcm:
+        teacher = tcm.group(1)
+        text = text.replace(teacher, "")
+
+    # 4. Предмет (Чистим мусор)
+    subject = _clean_subject_garbage(text)
+    if len(subject) < 2: subject = "Занятие"
+
+    return LessonItem(subject=subject, type=l_type, teacher=teacher, room=room, time_start="", time_end="", subgroup=None)
 
 def _parse_and_split_cell(text: str) -> List[LessonItem]:
     text_lower = text.lower()
-    # Триггеры для сложного парсинга
     is_complex = "язык" in text_lower or "спецмодуль" in text_lower or "физ" in text_lower
     
     if not is_complex:
@@ -230,7 +280,6 @@ def _parse_and_split_cell(text: str) -> List[LessonItem]:
         return [_extract_single_lesson(text)]
         
     results = []
-    # Базовое название (до первого препода)
     base_prefix = text[:teachers[0].start()]
     base_prefix = _clean_subject_garbage(base_prefix)
     if len(base_prefix) < 3: base_prefix = "Иностр. язык"
@@ -243,27 +292,23 @@ def _parse_and_split_cell(text: str) -> List[LessonItem]:
         
         chunk = text[prev_end:end]
         
-        # Аудитория
         room = ""
         rm = ROOM_PATTERN.search(chunk)
         if rm: room = rm.group(1)
         
-        # Тип
         l_type = "Прак"
         tm = TYPE_PATTERN.search(chunk)
         if tm: l_type = tm.group(1).capitalize()
         
-        # Подгруппа
         subgroup = f"Группа {i+1}"
         cl = chunk.lower()
         if "англ" in cl: subgroup = "Английский"
         elif "нем" in cl: subgroup = "Немецкий"
         elif "фран" in cl: subgroup = "Французский"
         elif "исп" in cl: subgroup = "Испанский"
-        elif "кит" in cl: subgroup = "Китайский"
 
         results.append(LessonItem(
-            subject=f"{base_prefix}", # ({subgroup}) убрал из названия, оно есть в subgroup
+            subject=base_prefix,
             type=l_type,
             teacher=t_name,
             room=room,
@@ -271,32 +316,3 @@ def _parse_and_split_cell(text: str) -> List[LessonItem]:
             subgroup=subgroup
         ))
     return results
-
-def _extract_single_lesson(text: str) -> LessonItem:
-    l_type = "Прак"
-    tm = TYPE_PATTERN.search(text)
-    if tm:
-        val = tm.group(1).lower()
-        if "лек" in val: l_type = "Лекция"
-        elif "сем" in val: l_type = "Семинар"
-        elif "лаб" in val: l_type = "Лаба"
-        elif "экз" in val: l_type = "Экзамен"
-        text = text.replace(tm.group(0), "")
-
-    room = ""
-    rm = ROOM_PATTERN.search(text)
-    if rm:
-        room = rm.group(1)
-        text = text.replace(room, "")
-
-    teacher = ""
-    tcm = TEACHER_PATTERN.search(text)
-    if tcm:
-        teacher = tcm.group(1)
-        text = text.replace(teacher, "")
-
-    # Финальная чистка
-    subject = _clean_subject_garbage(text)
-    if len(subject) < 2: subject = "Занятие"
-
-    return LessonItem(subject=subject, type=l_type, teacher=teacher, room=room, time_start="", time_end="", subgroup=None)
