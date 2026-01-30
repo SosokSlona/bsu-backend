@@ -29,7 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ВАЖНО: Убедись, что на сервере работает прокси (Shadowsocks или другой) на порту 1080
+# Прокси для работы из-за границы (SSH Tunnel)
 PROXIES = {
     "http": "socks5://localhost:1080",
     "https": "socks5://localhost:1080"
@@ -105,7 +105,7 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
     return res
 
 def process_pdf_images(content: bytes, course: int) -> List[str]:
-    # Старый метод для картинок
+    # Старый метод для картинок (Fallback)
     imgs = []
     try:
         with fitz.open(stream=content, filetype="pdf") as doc:
@@ -183,15 +183,27 @@ def login(data: LoginRequest):
 
 @app.post("/schedule/parse", response_model=ParsedScheduleResponse)
 def parse_schedule(data: ScheduleRequest):
-    """Скачивает PDF и парсит его в JSON"""
+    """Скачивает PDF и парсит его в JSON, определяя КУРС студента"""
     s = requests.Session()
     s.proxies.update(PROXIES)
     s.cookies.update(data.cookies)
+    
+    course = 1 # Дефолт
+    
     try:
+        # 1. Загружаем ЛК, чтобы узнать КУРС
         r = s.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=HEADERS, timeout=10)
         if "login.aspx" in r.url.lower(): raise HTTPException(401, "Session expired")
         soup = BeautifulSoup(r.text, 'html.parser')
         
+        # Определяем курс
+        kurs_span = soup.find("span", id=re.compile(r"lbStudKurs$"))
+        if kurs_span:
+            txt = clean_text(kurs_span.text)
+            cm = re.search(r'(\d+)\s*курс', txt)
+            if cm: course = int(cm.group(1))
+
+        # 2. Ищем PDF
         pdf_url = None
         for a in soup.find_all("a", href=True):
             href = str(a.get('href', ''))
@@ -199,8 +211,8 @@ def parse_schedule(data: ScheduleRequest):
                 pdf_url = "https://student.bsu.by" + href if href.startswith("/") else href
                 break
         
+        # Fallback на FIR
         if not pdf_url:
-            kurs_span = soup.find("span", id=re.compile(r"lbStudKurs$"))
             if kurs_span and "специальность:" in kurs_span.text.lower():
                 spec_raw = kurs_span.text.lower().split("специальность:")[1].split(",")[0].strip()
                 for key, val in SPECIALTY_MAP.items():
@@ -209,11 +221,12 @@ def parse_schedule(data: ScheduleRequest):
         
         if not pdf_url: raise HTTPException(404, "PDF schedule not found")
 
-        logger.info(f"Downloading PDF: {pdf_url}")
+        logger.info(f"Downloading PDF: {pdf_url} (Course: {course})")
         pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False)
         if pdf_resp.status_code != 200: raise HTTPException(502, "Failed to download PDF")
 
-        return parse_schedule_pdf(pdf_resp.content)
+        # 3. Передаем курс в парсер, чтобы он выбрал нужные страницы
+        return parse_schedule_pdf(pdf_resp.content, course)
 
     except Exception as e:
         logger.error(f"Parse error: {e}")
