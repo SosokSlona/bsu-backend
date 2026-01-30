@@ -57,12 +57,10 @@ SPECIALTY_MAP = {
 
 # --- КЕШИРОВАНИЕ ---
 CACHE_DIR = "schedule_cache"
-CACHE_VERSION = "v3" # Меняем версию, чтобы сбросить старый плохой кеш
+CACHE_VERSION = "v4" # НОВАЯ ВЕРСИЯ - СБРОСИТЬ СТАРЫЙ МУСОР
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
-# Множество для хранения всех запрошенных URL (чтобы обновлять их в фоне)
-# Формат: (pdf_url, course)
 ACTIVE_SCHEDULES: Set[tuple] = set()
 
 def get_cache_filename(pdf_url: str, course: int) -> str:
@@ -90,40 +88,28 @@ def save_to_cache(filename: str, data: ParsedScheduleResponse):
 
 # --- ФОНОВОЕ ОБНОВЛЕНИЕ ---
 async def refresh_schedules_task():
-    """Бесконечный цикл, который раз в 2 часа обновляет все известные расписания"""
     while True:
-        logger.info(f"🔄 Background Auto-Refresh started. Known schedules: {len(ACTIVE_SCHEDULES)}")
-        
-        for pdf_url, course in list(ACTIVE_SCHEDULES): # list() для копии, чтобы не сломать итератор
+        logger.info(f"🔄 Background Auto-Refresh. Schedules: {len(ACTIVE_SCHEDULES)}")
+        for pdf_url, course in list(ACTIVE_SCHEDULES):
             try:
-                logger.info(f"🔄 Refreshing: {pdf_url} (Course {course})")
                 s = requests.Session()
                 s.proxies.update(PROXIES)
                 pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False, timeout=30)
-                
                 if pdf_resp.status_code == 200:
-                    # Парсим в отдельном потоке
                     new_data = await asyncio.to_thread(parse_schedule_pdf, pdf_resp.content, course)
                     if new_data.groups:
                         cache_file = get_cache_filename(pdf_url, course)
                         save_to_cache(cache_file, new_data)
-                        logger.info(f"✅ Refreshed & Saved: {pdf_url}")
-            except Exception as e:
-                logger.error(f"❌ Refresh failed for {pdf_url}: {e}")
-            
-            # Пауза между запросами, чтобы не ддосить БГУ
+                        logger.info(f"✅ Refreshed: {pdf_url}")
+            except Exception: pass
             await asyncio.sleep(10)
-            
-        # Ждем 2 часа перед следующим кругом
-        logger.info("💤 Auto-Refresh sleeping for 2 hours...")
         await asyncio.sleep(2 * 60 * 60)
 
 @app.on_event("startup")
 async def startup_event():
-    # Запускаем фоновую задачу при старте сервера
     asyncio.create_task(refresh_schedules_task())
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- HELPER FUNCTIONS ---
 def clean_text(text: Any) -> str:
     if not text: return ""
     return re.sub(r'\s+', ' ', str(text).replace('\xa0', ' ').strip())
@@ -283,15 +269,11 @@ async def parse_schedule(data: ScheduleRequest):
         
         if not pdf_url: raise HTTPException(404, "PDF schedule not found")
 
-        # Добавляем в список для авто-обновления
         ACTIVE_SCHEDULES.add((pdf_url, course))
 
-        # --- ПРОВЕРКА КЕША ---
         cache_file = get_cache_filename(pdf_url, course)
         cached_data = load_from_cache(cache_file)
         
-        # Если кеш есть, отдаем его СРАЗУ (даже если он вчерашний, он обновится в фоне)
-        # Но если мы только что сменили версию кеша (v2 -> v3), он не найдется, и мы скачаем свежий
         if cached_data:
             logger.info(f"CACHE HIT: {cache_file}")
             return cached_data
@@ -301,6 +283,7 @@ async def parse_schedule(data: ScheduleRequest):
         if pdf_resp.status_code != 200: raise HTTPException(502, "Failed to download PDF")
 
         logger.info("Starting heavy OCR task in background thread...")
+        # АСИНХРОННЫЙ ЗАПУСК - НЕ БЛОКИРУЕТ СЕРВЕР
         parsed_data = await asyncio.to_thread(parse_schedule_pdf, pdf_resp.content, course)
         
         if parsed_data.groups:
