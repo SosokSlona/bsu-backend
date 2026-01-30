@@ -4,14 +4,13 @@ import base64
 import requests
 import uvicorn
 import ddddocr
-import fitz # Оставляем для старых функций картинок
+import fitz 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Optional
 import time
 
-# Наши модули
 from models import LoginRequest, ScheduleRequest, ParsedScheduleResponse
 from schedule_parser import parse_schedule_pdf
 
@@ -29,7 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Прокси для работы из-за границы (SSH Tunnel)
 PROXIES = {
     "http": "socks5://localhost:1080",
     "https": "socks5://localhost:1080"
@@ -53,7 +51,6 @@ SPECIALTY_MAP = {
     "менеджмент": "ITG_timetable.pdf"
 }
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def clean_text(text: Any) -> str:
     if not text: return ""
     return re.sub(r'\s+', ' ', str(text).replace('\xa0', ' ').strip())
@@ -105,7 +102,6 @@ def parse_grade(cols: List[Any]) -> Dict[str, str]:
     return res
 
 def process_pdf_images(content: bytes, course: int) -> List[str]:
-    # Старый метод для картинок (Fallback)
     imgs = []
     try:
         with fitz.open(stream=content, filetype="pdf") as doc:
@@ -134,8 +130,6 @@ def get_fir_pdf_images(spec_name: str, course: int) -> List[str]:
         if r.status_code == 200: return process_pdf_images(r.content, course)
     except: pass
     return []
-
-# --- API ENDPOINTS ---
 
 @app.post("/login")
 def login(data: LoginRequest):
@@ -191,19 +185,16 @@ def parse_schedule(data: ScheduleRequest):
     course = 1 # Дефолт
     
     try:
-        # 1. Загружаем ЛК, чтобы узнать КУРС
         r = s.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=HEADERS, timeout=10)
         if "login.aspx" in r.url.lower(): raise HTTPException(401, "Session expired")
         soup = BeautifulSoup(r.text, 'html.parser')
         
-        # Определяем курс
         kurs_span = soup.find("span", id=re.compile(r"lbStudKurs$"))
         if kurs_span:
             txt = clean_text(kurs_span.text)
             cm = re.search(r'(\d+)\s*курс', txt)
             if cm: course = int(cm.group(1))
 
-        # 2. Ищем PDF
         pdf_url = None
         for a in soup.find_all("a", href=True):
             href = str(a.get('href', ''))
@@ -211,7 +202,6 @@ def parse_schedule(data: ScheduleRequest):
                 pdf_url = "https://student.bsu.by" + href if href.startswith("/") else href
                 break
         
-        # Fallback на FIR
         if not pdf_url:
             if kurs_span and "специальность:" in kurs_span.text.lower():
                 spec_raw = kurs_span.text.lower().split("специальность:")[1].split(",")[0].strip()
@@ -225,7 +215,6 @@ def parse_schedule(data: ScheduleRequest):
         pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False)
         if pdf_resp.status_code != 200: raise HTTPException(502, "Failed to download PDF")
 
-        # 3. Передаем курс в парсер, чтобы он выбрал нужные страницы
         return parse_schedule_pdf(pdf_resp.content, course)
 
     except Exception as e:
@@ -234,7 +223,6 @@ def parse_schedule(data: ScheduleRequest):
 
 @app.post("/schedule")
 def get_data(data: ScheduleRequest):
-    # Старый метод (оценки, новости, картинки расписания)
     s = requests.Session()
     s.proxies.update(PROXIES)
     s.cookies.update(data.cookies)
@@ -247,14 +235,12 @@ def get_data(data: ScheduleRequest):
         if "login.aspx" in r.url.lower(): raise HTTPException(401, "Session expired")
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        # Семестры
         sem_select = soup.find("select", id=re.compile("ddlSemestr")) or soup.find("select", id=re.compile("ddlKurs"))
         if sem_select:
             for opt in sem_select.find_all("option"):
                 resp["semesters"].append({"id": opt.get("value"), "name": opt.get_text(strip=True), "selected": opt.get("selected") is not None})
                 if opt.get("selected"): resp["current_semester_id"] = opt.get("value")
         
-        # Смена семестра
         if data.period_id and sem_select and data.period_id != resp["current_semester_id"]:
             payload = {inp.get("name"): inp.get("value", "") for inp in soup.find_all("input", type="hidden")}
             payload["__EVENTTARGET"] = sem_select.get("name")
@@ -263,7 +249,6 @@ def get_data(data: ScheduleRequest):
             soup = BeautifulSoup(r.text, 'html.parser')
             resp["current_semester_id"] = data.period_id
 
-        # Инфо
         fio_tag = soup.find("span", id=re.compile(r"lbFIO1$"))
         if fio_tag: resp["fio"] = clean_text(fio_tag.text)
         
@@ -280,14 +265,12 @@ def get_data(data: ScheduleRequest):
             if "специальность:" in txt.lower(): resp["specialty"] = txt.lower().split("специальность:")[1].split(",")[0].strip().capitalize()
             else: resp["specialty"] = txt
             
-        # Фото
         if soup.find("img", id=re.compile(r"imgStudPhoto$")):
             try:
                 ri = s.get("https://student.bsu.by/Photo/Photo.aspx", headers=HEADERS)
                 if ri.status_code == 200: resp["photo_base64"] = base64.b64encode(ri.content).decode('utf-8')
             except: pass
             
-        # Оценки
         table = None
         for t in soup.find_all("table"):
             if "№ п/п" in t.text: table = t; break
@@ -309,7 +292,6 @@ def get_data(data: ScheduleRequest):
                             ti += 1
                     resp["subjects"].append({"name": nm, "hours": hm, "mark": grade["mark"], "color": grade["color_type"]})
 
-        # Картинки расписания (Fallback)
         pdf_found = False
         for a in soup.find_all("a", href=True):
             href = str(a.get('href', ''))
@@ -321,7 +303,6 @@ def get_data(data: ScheduleRequest):
                 except: pass
         if not pdf_found and resp["specialty"]: resp["schedule_images"] = get_fir_pdf_images(str(resp["specialty"]), course)
 
-        # Новости
         try:
             rn = s.get("https://student.bsu.by/PersonalCabinet/News", headers=HEADERS)
             sn = BeautifulSoup(rn.text, 'html.parser')

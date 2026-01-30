@@ -1,28 +1,25 @@
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 
-# --- НОВЫЕ МОДЕЛИ (для парсера pdfplumber) ---
+# --- МОДЕЛИ ДАННЫХ ---
 
 class LessonItem(BaseModel):
-    subject: str          # Название предмета
-    type: str             # (Лек) / (Прак)
-    teacher: str          # Иванов И.И.
+    subject: str          # Название предмета (очищенное)
+    type: str             # (Прак) / (Лек)
+    teacher: str          # Фамилия И.О.
     room: str             # 501
     time_start: str       # 09:00
     time_end: str         # 10:20
+    subgroup: Optional[str] = None # "Английский" или "1 подгруппа"
 
 class DaySchedule(BaseModel):
     day_name: str
     lessons: List[LessonItem]
 
-# Ответ: { "Группа 13": [Пн, Вт...], "Группа 14": [...] }
 class ParsedScheduleResponse(BaseModel):
     groups: Dict[str, List[DaySchedule]]
 
-
-# --- СТАРЫЕ МОДЕЛИ (для main.py / Login) ---
-# Именно их не хватало, из-за чего ошибка ImportError
-
+# --- МОДЕЛИ ЗАПРОСОВ ---
 class LoginRequest(BaseModel):
     username: str
     password: str
