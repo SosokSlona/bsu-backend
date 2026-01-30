@@ -1,0 +1,15 @@
+[Unit]
+Description=BSU Backend Service
+After=network.target
+
+[Service]
+User=parkensonbob
+Group=parkensonbob
+WorkingDirectory=/home/parkensonbob/bsu-backend/backend
+Environment="PATH=/home/parkensonbob/bsu-backend/backend/venv/bin"
+ExecStart=/home/parkensonbob/bsu-backend/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
