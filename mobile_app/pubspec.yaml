@@ -9,7 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # Добавляем недостающие пакеты
   http: ^1.2.0
   shared_preferences: ^2.2.2
 
