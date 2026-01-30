@@ -3,113 +3,116 @@ from pdf2image import convert_from_bytes
 import cv2
 import numpy as np
 import re
+import time
 from typing import List, Dict, Optional
 from models import ParsedScheduleResponse, DaySchedule, LessonItem
 
-# Конфиг Tesseract (быстрый режим)
+# Конфиг Tesseract: режим блока текста
 TESS_CONFIG = r'--oem 3 --psm 6 -l rus+eng'
 
-# Регулярки
 TIME_PATTERN = re.compile(r'(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})')
-ROOM_PATTERN = re.compile(r'\b(\d{3,4}[а-я]?|с/з|с/к|ауд\.?)\b', re.IGNORECASE)
-TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?|ф)\)', re.IGNORECASE)
 TEACHER_PATTERN = re.compile(r'([A-ЯЁ][а-яё]+(?:\s+[A-ЯЁ]\.){1,2})')
+TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?|ф)\)', re.IGNORECASE)
 
-# СЛОВА-ПАРАЗИТЫ (Если они есть в заголовке - это НЕ группа)
+# ЧЕРНЫЙ СПИСОК (Включая перевертыши)
+# Если в колонке встречается любое из этих слов — это НЕ группа.
 FORBIDDEN_GROUP_WORDS = [
-    'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 
-    'день', 'дни', 'время', 'часы', 'гревтеч', 'киньледеноп', 'начало', 'конец'
+    'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье',
+    'день', 'дни', 'время', 'часы', 'начало', 'конец',
+    'гревтеч', 'киньледеноп', 'адерс', 'кинротв', 'ацинт'
 ]
 
 def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
-    print("DEBUG: Starting OCR Parsing...")
+    print(f"⏱️ [OCR] START Parsing. Bytes: {len(pdf_bytes)}")
     schedule_by_group: Dict[str, Dict[str, List[LessonItem]]] = {}
     
     if course < 1: course = 1
     start_page = (course - 1) * 2
     
     try:
-        # DPI 200 - оптимально для скорости/качества
+        # DPI 200 — баланс скорости
         images = convert_from_bytes(pdf_bytes, dpi=200, first_page=start_page+1, last_page=start_page+2)
     except Exception as e:
-        print(f"DEBUG: PDF Convert Error: {e}")
+        print(f"❌ PDF Convert Error: {e}")
         return ParsedScheduleResponse(groups={})
 
     for pg_num, img in enumerate(images):
+        print(f"📄 Processing Page {pg_num+1}...")
         open_cv_image = np.array(img) 
         original_img = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
         
-        # Отрезаем шапку (верхние 12%), чтобы убрать специальность
-        height, width, _ = original_img.shape
-        crop_y = int(height * 0.12)
-        roi_img = original_img[crop_y:height, 0:width]
+        # 1. Жесткая обрезка шапки (верхние 12%)
+        h, w, _ = original_img.shape
+        crop_y = int(h * 0.12)
+        roi_img = original_img[crop_y:h, 0:w]
         
+        # 2. Поиск ячеек
         cells = _find_table_cells(roi_img)
         if not cells: continue
-
         rows = _group_cells_into_rows(cells)
         if not rows: continue
 
-        # Анализ колонок
+        # 3. Анализ структуры
         col_roles = _analyze_column_roles(rows[0], roi_img)
         day_col = col_roles.get('day')
         time_col = col_roles.get('time')
-        group_cols = col_roles.get('groups', [])
+        # Изначально считаем группами всё, что не день и не время
+        candidate_groups = col_roles.get('groups', [])
         
-        # FALLBACK: Если время не нашли, считаем 2-ю колонку временем (если таблица широкая)
+        # Fallback: Если время не нашли, берем 2-ю колонку
         if time_col is None and len(rows[0]) > 2:
             time_col = 1
         
-        # Если групп не нашли автоматически, берем всё правее времени
-        if not group_cols: 
+        # Fallback: Если групп нет, берем всё правее времени
+        if not candidate_groups: 
              t_idx = time_col if time_col is not None else 1
              for i in range(t_idx + 1, len(rows[0])):
-                 group_cols.append(i)
+                 candidate_groups.append(i)
 
-        # ФИНАЛЬНЫЙ ФИЛЬТР ГРУПП (Убираем фантомы)
-        # Проверяем каждую колонку-кандидата: не мусор ли это?
-        valid_group_cols = []
-        for g_idx in group_cols:
+        # 4. ФИЛЬТРАЦИЯ ФАНТОМОВ (Самое важное!)
+        valid_groups = []
+        for g_idx in candidate_groups:
             if not _is_forbidden_column(rows, g_idx, roi_img):
-                valid_group_cols.append(g_idx)
-        group_cols = valid_group_cols
-
+                valid_groups.append(g_idx)
+            else:
+                print(f"🗑️ Dropped phantom column {g_idx} (Trash/Day detected)")
+        
+        group_cols = valid_groups
         current_day = "Понедельник"
 
+        # 5. Парсинг строк
         for row in rows[1:]:
-            # А. День
+            # День
             if day_col is not None:
                 d_cell = _get_cell_at_col(row, day_col)
                 if d_cell:
-                    d_text = _ocr_cell(roi_img, d_cell)
-                    if _is_day_of_week(d_text):
-                        current_day = d_text.capitalize()
+                    d_txt = _ocr_cell(roi_img, d_cell)
+                    if _is_day_of_week(d_txt):
+                        current_day = d_txt.capitalize()
 
-            # Б. Время (С ЗАЩИТОЙ ОТ None)
+            # Время
+            t_cell = None
             if time_col is not None:
                 t_cell = _get_cell_at_col(row, time_col)
-            elif len(rows[0]) > 1: # Попытка угадать, если time_col None
-                t_cell = _get_cell_at_col(row, 1) 
-            else:
-                continue # Без времени строка бесполезна
+            elif len(row) > 1:
+                t_cell = row[1] # Попытка угадать
 
             if not t_cell: continue
             
-            t_text = _ocr_cell(roi_img, t_cell)
-            t_match = TIME_PATTERN.search(t_text)
+            t_txt = _ocr_cell(roi_img, t_cell)
+            t_match = TIME_PATTERN.search(t_txt)
             if not t_match: continue 
             
             t_start = t_match.group(1).replace('.', ':')
             t_end = t_match.group(2).replace('.', ':')
 
-            # В. Группы
+            # Группы
             for g_idx in group_cols:
                 g_cell = _get_cell_at_col(row, g_idx)
                 
                 # Look Left (Лекции)
                 final_cell = g_cell
                 if _is_cell_empty(roi_img, g_cell):
-                    # Безопасный скан слева
                     start_scan = (time_col + 1) if time_col is not None else 1
                     for scan_idx in range(start_scan, g_idx):
                         neighbor = _get_cell_at_col(row, scan_idx)
@@ -127,17 +130,14 @@ def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
                 g_name = _get_group_name_from_header(rows[0], g_idx, roi_img)
                 lessons = _parse_lesson_text(raw_text)
                 
-                if g_name not in schedule_by_group:
-                    schedule_by_group[g_name] = {}
-                if current_day not in schedule_by_group[g_name]:
-                    schedule_by_group[g_name][current_day] = []
+                if g_name not in schedule_by_group: schedule_by_group[g_name] = {}
+                if current_day not in schedule_by_group[g_name]: schedule_by_group[g_name][current_day] = []
                 
                 for l in lessons:
                     l.time_start = t_start
                     l.time_end = t_end
                     schedule_by_group[g_name][current_day].append(l)
 
-    # Сборка
     final_output = {}
     for g_name, days in schedule_by_group.items():
         if not days: continue
@@ -155,6 +155,7 @@ def _find_table_cells(img):
     thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY, 11, 2)
     thresh = 255 - thresh
+    # Ядра для поиска линий
     kernel_len = np.array(img).shape[1] // 100
     ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
     hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
@@ -193,7 +194,7 @@ def _group_cells_into_rows(cells):
 
 def _ocr_cell(img, rect):
     x, y, w, h = rect
-    roi = img[y+2:y+h-2, x+2:x+w-2]
+    roi = img[y+2:y+h-2, x+2:x+w-2] # Padding
     if roi.size == 0: return ""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -204,37 +205,37 @@ def _analyze_column_roles(header_row, img):
     roles = {'groups': []}
     for i, rect in enumerate(header_row):
         txt = _ocr_cell(img, rect).lower()
-        
-        # Если в заголовке запрещенное слово - это точно не группа
-        is_forbidden = any(f in txt for f in FORBIDDEN_GROUP_WORDS)
-        
-        if is_forbidden:
+        # Если в заголовке мусор - это Day/Time, но точно не группа
+        if any(f in txt for f in FORBIDDEN_GROUP_WORDS):
             if any(d in txt for d in ['понедельник', 'вторник', 'дни']):
                 roles['day'] = i
             elif any(t in txt for t in ['время', 'часы', '8.30']):
                 roles['time'] = i
-        elif len(txt) > 2 and "специальность" not in txt:
+            continue
+        
+        if len(txt) > 2 and "специальность" not in txt:
             roles['groups'].append(i)
     return roles
 
 def _is_forbidden_column(rows, col_idx, img):
-    """Проверяет контент колонки на мусор/дни недели"""
-    content_count = 0
-    forbidden_hits = 0
+    """Проверяет колонку на мусор. Возвращает True, если колонка плохая."""
+    hits = 0
+    empty_count = 0
+    total_checked = 0
     
     # Проверяем первые 8 строк
     for r in rows[:8]:
         cell = _get_cell_at_col(r, col_idx)
         if cell:
             txt = _ocr_cell(img, cell).lower()
+            if len(txt) < 3: empty_count += 1
             if any(f in txt for f in FORBIDDEN_GROUP_WORDS):
-                forbidden_hits += 1
-            if len(txt) > 3:
-                content_count += 1
-    
-    # Если слишком много совпадений с днями недели или мало контента - это мусор
-    if forbidden_hits > 0: return True
-    if content_count == 0: return True # Пустая колонка
+                hits += 1
+            total_checked += 1
+            
+    # Если найден мусор или колонка почти пустая — это фантом
+    if hits > 0: return True
+    if total_checked > 0 and (empty_count / total_checked) > 0.8: return True 
     
     return False
 
@@ -247,7 +248,7 @@ def _is_cell_empty(img, rect):
     roi = img[y:y+h, x:x+w]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     non_zero = cv2.countNonZero(255 - gray)
-    return non_zero < 50
+    return non_zero < 40
 
 def _get_group_name_from_header(header_row, col_idx, img):
     if col_idx >= len(header_row): return f"Группа {col_idx}"
@@ -276,13 +277,14 @@ def _parse_lesson_text(text: str) -> List[LessonItem]:
         item = _extract_single(chunk)
         item.subject = base
         item.teacher = t_name
-        chunk_lower = chunk.lower()
+        # Подгруппа
+        cl = chunk.lower()
         sub = f"Группа {i+1}"
-        if "англ" in chunk_lower: sub = "Английский"
-        elif "нем" in chunk_lower: sub = "Немецкий"
-        elif "фран" in chunk_lower: sub = "Французский"
-        elif "исп" in chunk_lower: sub = "Испанский"
-        elif "кит" in chunk_lower: sub = "Китайский"
+        if "англ" in cl: sub = "Английский"
+        elif "нем" in cl: sub = "Немецкий"
+        elif "фран" in cl: sub = "Французский"
+        elif "исп" in cl: sub = "Испанский"
+        elif "кит" in cl: sub = "Китайский"
         item.subgroup = sub
         results.append(item)
     return results
