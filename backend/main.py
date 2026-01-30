@@ -5,11 +5,15 @@ import requests
 import uvicorn
 import ddddocr
 import fitz 
-from fastapi import FastAPI, HTTPException
+import os
+import json
+import hashlib
+import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Optional
-import time
+from typing import List, Dict, Any, Optional, Set
+from datetime import datetime, timedelta
 
 from models import LoginRequest, ScheduleRequest, ParsedScheduleResponse
 from schedule_parser import parse_schedule_pdf
@@ -51,6 +55,75 @@ SPECIALTY_MAP = {
     "менеджмент": "ITG_timetable.pdf"
 }
 
+# --- КЕШИРОВАНИЕ ---
+CACHE_DIR = "schedule_cache"
+CACHE_VERSION = "v3" # Меняем версию, чтобы сбросить старый плохой кеш
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+# Множество для хранения всех запрошенных URL (чтобы обновлять их в фоне)
+# Формат: (pdf_url, course)
+ACTIVE_SCHEDULES: Set[tuple] = set()
+
+def get_cache_filename(pdf_url: str, course: int) -> str:
+    unique_str = f"{pdf_url}_course_{course}_{CACHE_VERSION}"
+    hash_obj = hashlib.md5(unique_str.encode())
+    return os.path.join(CACHE_DIR, f"{hash_obj.hexdigest()}.json")
+
+def load_from_cache(filename: str) -> Optional[ParsedScheduleResponse]:
+    if not os.path.exists(filename):
+        return None
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return ParsedScheduleResponse(**data)
+    except Exception as e:
+        logger.error(f"Cache read error: {e}")
+        return None
+
+def save_to_cache(filename: str, data: ParsedScheduleResponse):
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(data.json())
+    except Exception as e:
+        logger.error(f"Cache write error: {e}")
+
+# --- ФОНОВОЕ ОБНОВЛЕНИЕ ---
+async def refresh_schedules_task():
+    """Бесконечный цикл, который раз в 2 часа обновляет все известные расписания"""
+    while True:
+        logger.info(f"🔄 Background Auto-Refresh started. Known schedules: {len(ACTIVE_SCHEDULES)}")
+        
+        for pdf_url, course in list(ACTIVE_SCHEDULES): # list() для копии, чтобы не сломать итератор
+            try:
+                logger.info(f"🔄 Refreshing: {pdf_url} (Course {course})")
+                s = requests.Session()
+                s.proxies.update(PROXIES)
+                pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False, timeout=30)
+                
+                if pdf_resp.status_code == 200:
+                    # Парсим в отдельном потоке
+                    new_data = await asyncio.to_thread(parse_schedule_pdf, pdf_resp.content, course)
+                    if new_data.groups:
+                        cache_file = get_cache_filename(pdf_url, course)
+                        save_to_cache(cache_file, new_data)
+                        logger.info(f"✅ Refreshed & Saved: {pdf_url}")
+            except Exception as e:
+                logger.error(f"❌ Refresh failed for {pdf_url}: {e}")
+            
+            # Пауза между запросами, чтобы не ддосить БГУ
+            await asyncio.sleep(10)
+            
+        # Ждем 2 часа перед следующим кругом
+        logger.info("💤 Auto-Refresh sleeping for 2 hours...")
+        await asyncio.sleep(2 * 60 * 60)
+
+@app.on_event("startup")
+async def startup_event():
+    # Запускаем фоновую задачу при старте сервера
+    asyncio.create_task(refresh_schedules_task())
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def clean_text(text: Any) -> str:
     if not text: return ""
     return re.sub(r'\s+', ' ', str(text).replace('\xa0', ' ').strip())
@@ -112,7 +185,7 @@ def process_pdf_images(content: bytes, course: int) -> List[str]:
                 end = min(start + 2, total)
             if total <= 2: start, end = 0, total
             for i in range(start, end):
-                pix = doc[i].get_pixmap(matrix=fitz.Matrix(3, 3))
+                pix = doc[i].get_pixmap(matrix=fitz.Matrix(2, 2))
                 imgs.append(base64.b64encode(pix.tobytes("jpg")).decode('utf-8'))
     except: pass
     return imgs
@@ -176,13 +249,12 @@ def login(data: LoginRequest):
     raise HTTPException(401, "Login failed")
 
 @app.post("/schedule/parse", response_model=ParsedScheduleResponse)
-def parse_schedule(data: ScheduleRequest):
-    """Скачивает PDF и парсит его в JSON, определяя КУРС студента"""
+async def parse_schedule(data: ScheduleRequest):
     s = requests.Session()
     s.proxies.update(PROXIES)
     s.cookies.update(data.cookies)
     
-    course = 1 # Дефолт
+    course = 1 
     
     try:
         r = s.get("https://student.bsu.by/PersonalCabinet/StudProgress", headers=HEADERS, timeout=10)
@@ -211,11 +283,31 @@ def parse_schedule(data: ScheduleRequest):
         
         if not pdf_url: raise HTTPException(404, "PDF schedule not found")
 
-        logger.info(f"Downloading PDF: {pdf_url} (Course: {course})")
+        # Добавляем в список для авто-обновления
+        ACTIVE_SCHEDULES.add((pdf_url, course))
+
+        # --- ПРОВЕРКА КЕША ---
+        cache_file = get_cache_filename(pdf_url, course)
+        cached_data = load_from_cache(cache_file)
+        
+        # Если кеш есть, отдаем его СРАЗУ (даже если он вчерашний, он обновится в фоне)
+        # Но если мы только что сменили версию кеша (v2 -> v3), он не найдется, и мы скачаем свежий
+        if cached_data:
+            logger.info(f"CACHE HIT: {cache_file}")
+            return cached_data
+
+        logger.info(f"CACHE MISS. Downloading: {pdf_url}")
         pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False)
         if pdf_resp.status_code != 200: raise HTTPException(502, "Failed to download PDF")
 
-        return parse_schedule_pdf(pdf_resp.content, course)
+        logger.info("Starting heavy OCR task in background thread...")
+        parsed_data = await asyncio.to_thread(parse_schedule_pdf, pdf_resp.content, course)
+        
+        if parsed_data.groups:
+            save_to_cache(cache_file, parsed_data)
+            logger.info(f"Saved to cache: {cache_file}")
+        
+        return parsed_data
 
     except Exception as e:
         logger.error(f"Parse error: {e}")
