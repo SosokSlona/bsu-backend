@@ -56,7 +56,7 @@ SPECIALTY_MAP = {
 
 # --- КЕШИРОВАНИЕ ---
 CACHE_DIR = "schedule_cache"
-CACHE_VERSION = "v7" 
+CACHE_VERSION = "v0" 
 if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
 ACTIVE_SCHEDULES: Set[tuple] = set()

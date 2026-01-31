@@ -1,210 +1,212 @@
-import fitz  # PyMuPDF
+import pdfplumber
 import re
-from typing import List, Dict
+import io
+from typing import List, Dict, Optional
 from models import ParsedScheduleResponse, DaySchedule, LessonItem
 
 # --- РЕГУЛЯРКИ ---
+# Время: 08:30, 8.30
 TIME_PATTERN = re.compile(r'(\d{1,2}[:.]\d{2})')
-# Ищем паттерн: "Фамилия И.О." или "Имя (иностранное)"
-TEACHER_PATTERN = re.compile(r'([A-ЯЁ][а-яё]+(?:-[A-ЯЁ][а-яё]+)?\s+(?:[A-ЯЁ]\.\s?[A-ЯЁ]\.|[A-ЯЁ][а-яё]+))')
-# Тип занятия
+
+# Преподаватель (Улучшенная):
+# 1. Фамилия (м.б. двойная)
+# 2. Пробел
+# 3. Инициалы (И. или И.О. или И. О.)
+# Пример: Ходакова А.А., Соловей А.Н., Петров В. В.
+TEACHER_PATTERN = re.compile(r'([A-ЯЁ][а-яё]+(?:-[A-ЯЁ][а-яё]+)?\s+[A-ЯЁ]\.\s?(?:[A-ЯЁ]\.)?)')
+
 TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?|ф|семинар)\)', re.IGNORECASE)
-# Аудитория (3-4 цифры, с/к)
 ROOM_PATTERN = re.compile(r'\b(\d{3,4}[а-я]?|с/к|с/з|ауд\.?)\b', re.IGNORECASE)
 
-# Запрещенные слова для названий групп (защита от мусора)
-BAD_GROUP_NAMES = ["дни", "часы", "курс", "специальность", "форма"]
-
 def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
-    print(f"🚀 [PyMuPDF] Starting. Size: {len(pdf_bytes)}")
+    print(f"🌊 [STREAM] Starting analysis. Size: {len(pdf_bytes)} bytes")
     schedule_by_group: Dict[str, Dict[str, List[LessonItem]]] = {}
     
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        # Страницы курса
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         start_page = max(0, (course - 1) * 2)
-        # Берем 3 страницы с запасом
-        pages = list(doc)[start_page : start_page + 3]
+        pages = pdf.pages[start_page : start_page + 3] # Берем 3 страницы с запасом
         
-        for p_num, page in enumerate(pages):
-            print(f"📄 Page {p_num + 1}...")
+        for page_num, page in enumerate(pages):
+            print(f"📄 Processing Page {page_num + 1}...")
+            width = page.width
+            height = page.height
             
-            # Получаем структуру страницы (словарями)
-            # flag=0 (текст), sort=True (порядок чтения)
-            text_instances = page.get_text("words", sort=True)
+            # 1. Сбор слов
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=True)
+            if not words: continue
+
+            # 2. Поиск Времени (Ось Y)
+            # Находим все Y-координаты, где есть время
+            time_zones = []
+            for w in words:
+                if TIME_PATTERN.match(w['text']) and float(w['x0']) < 200: # Время слева
+                    time_zones.append(w)
             
-            # 1. ПОИСК ВРЕМЕНИ (Ось Y)
-            time_rows = []
-            for x0, y0, x1, y1, text, block_no, line_no, word_no in text_instances:
-                if x0 < 200 and TIME_PATTERN.match(text): # Время обычно слева
-                    # Группируем время по строкам (допуск 10px по Y)
-                    found = False
-                    for tr in time_rows:
-                        if abs(tr['y'] - y0) < 15:
-                            tr['text'] += text
-                            found = True
-                            break
-                    if not found:
-                        time_rows.append({'y': y0, 'text': text, 'bottom': y1})
-            
-            if not time_rows:
-                print("⚠️ No time found. Skipping.")
+            if not time_zones:
+                print("⚠️ No time slots found. Skipping page.")
                 continue
                 
-            # Уточняем границы строк времени
-            time_rows.sort(key=lambda x: x['y'])
-            for i in range(len(time_rows) - 1):
-                time_rows[i]['end_y'] = time_rows[i+1]['y']
-            time_rows[-1]['end_y'] = page.rect.height
-
-            # Граница шапки - это верх первого времени
-            header_limit_y = time_rows[0]['y']
-
-            # 2. ПОИСК ГРУПП (Ось X)
-            # Ищем текст выше header_limit_y
-            header_words = [w for w in text_instances if w[3] < header_limit_y] # w[3] is bottom_y
+            # Сортируем время и удаляем дубликаты (рядом стоящие)
+            time_zones.sort(key=lambda w: w['top'])
+            cleaned_times = []
+            if time_zones:
+                cleaned_times.append(time_zones[0])
+                for t in time_zones[1:]:
+                    if abs(t['top'] - cleaned_times[-1]['top']) > 15: # Новый слот
+                        cleaned_times.append(t)
             
+            # Верхняя граница таблицы (первое время)
+            table_top = cleaned_times[0]['top'] - 10
+            # Левая граница данных (справа от времени)
+            data_left_boundary = max([t['x1'] for t in cleaned_times]) + 5
+
+            # 3. Анализ Колонок (Метод "Потока")
+            # Берем все слова, которые ВЫШЕ первого времени (Шапка) и ПРАВЕЕ времени
+            header_words = [w for w in words if w['top'] < table_top and w['x0'] > data_left_boundary]
+            
+            # Ищем заголовки групп
             group_cols = []
+            header_words.sort(key=lambda w: w['x0'])
             
-            # Проход 1: Ищем слово "Группа"
             for i, w in enumerate(header_words):
-                txt = w[4].lower()
-                if "груп" in txt:
-                    # Ищем число рядом (в этом слове или следующем)
+                txt = w['text'].lower()
+                # Логика: Ищем слово "Группа" или "Гр"
+                if "груп" in txt or "гр." in txt:
+                    # Пытаемся найти номер (в этом слове или соседнем)
                     g_num = ""
                     # "Группа13"
-                    digits = re.findall(r'\d{2,3}', txt)
-                    if digits: 
-                        g_num = digits[0]
-                        center = (w[0] + w[2]) / 2
-                    # "Группа" "13"
-                    elif i + 1 < len(header_words):
+                    nums = re.findall(r'\d+', txt)
+                    if nums: g_num = nums[0]
+                    # "Группа" ... "13"
+                    elif i+1 < len(header_words):
                         next_w = header_words[i+1]
-                        if next_w[4].isdigit():
-                            g_num = next_w[4]
-                            center = (next_w[0] + next_w[2]) / 2
+                        if next_w['text'].isdigit(): g_num = next_w['text']
                     
-                    if g_num and g_num not in BAD_GROUP_NAMES:
+                    if g_num:
+                        # Центр колонки
+                        center = (w['x0'] + w['x1']) / 2
                         group_cols.append({'name': g_num, 'center': center})
 
-            # Проход 2: Если не нашли слово "Группа", ищем просто 2-значные числа в шапке справа
+            # Если не нашли явные заголовки, ищем просто числа в шапке (Фолбэк)
             if not group_cols:
-                print("⚠️ Explicit 'Group' headers missing. Searching for stand-alone numbers...")
                 for w in header_words:
-                    if w[0] > 150 and w[4].isdigit() and len(w[4]) == 2: # x > 150 (справа от дней)
-                         group_cols.append({'name': w[4], 'center': (w[0] + w[2])/2})
+                    if w['text'].isdigit() and len(w['text']) == 2: # 13, 14, 17...
+                        # Исключаем года (20, 21, 22...)
+                        val = int(w['text'])
+                        if 1 <= val <= 30: # Разумный диапазон групп
+                             group_cols.append({'name': w['text'], 'center': (w['x0'] + w['x1'])/2})
 
-            # Фильтр дубликатов (если одно и то же число найдено дважды рядом)
-            group_cols.sort(key=lambda g: g['center'])
+            # Удаляем дубликаты (если одна группа найдена дважды)
             unique_cols = []
             if group_cols:
+                group_cols.sort(key=lambda g: g['center'])
                 unique_cols.append(group_cols[0])
                 for g in group_cols[1:]:
                     if abs(g['center'] - unique_cols[-1]['center']) > 50:
                         unique_cols.append(g)
             group_cols = unique_cols
-
-            print(f"   🏛️ Groups: {[g['name'] for g in group_cols]}")
             
+            print(f"   🏛️ Groups Found: {[g['name'] for g in group_cols]}")
             if not group_cols: continue
 
-            # Строим границы колонок
-            final_columns = []
-            for i, g in enumerate(group_cols):
+            # Вычисляем границы колонок (середина между центрами)
+            col_boundaries = [] # [(x_start, x_end, name)]
+            for i in range(len(group_cols)):
                 # Левая граница
-                left = (group_cols[i-1]['center'] + g['center']) / 2 if i > 0 else 200 # 200 - отступ от времени
+                if i == 0:
+                    left = data_left_boundary
+                else:
+                    left = (group_cols[i-1]['center'] + group_cols[i]['center']) / 2
+                
                 # Правая граница
-                right = (g['center'] + group_cols[i+1]['center']) / 2 if i < len(group_cols) - 1 else page.rect.width
-                final_columns.append({'name': g['name'], 'x0': left, 'x1': right})
+                if i == len(group_cols) - 1:
+                    right = width
+                else:
+                    right = (group_cols[i]['center'] + group_cols[i+1]['center']) / 2
+                
+                col_boundaries.append({'name': group_cols[i]['name'], 'x0': left, 'x1': right})
 
-            # 3. РАСПРЕДЕЛЕНИЕ БЛОКОВ
-            # Получаем текст БЛОКАМИ (это сохраняет структуру "Предмет Препод")
-            blocks = page.get_text("blocks", sort=True)
-            
+            # 4. Парсинг Строк
             current_day = "Понедельник"
             
-            for b in blocks:
-                # b = (x0, y0, x1, y1, text, block_no, block_type)
-                bx0, by0, bx1, by1, btext, _, _ = b
+            for i, t_slot in enumerate(cleaned_times):
+                # Границы строки по Y
+                row_top = t_slot['top'] - 5
+                row_bottom = cleaned_times[i+1]['top'] - 5 if i < len(cleaned_times)-1 else height
                 
-                # Чистим текст
-                btext = btext.replace('\n', ' ').strip()
-                if len(btext) < 3 or "с/к" in btext.lower(): continue
-
-                # А. Определение дня недели (слева)
-                if bx1 < 150: 
-                    low = btext.lower()
-                    for d in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
-                        if d in low: current_day = d.capitalize()
-                    continue
-
-                # Б. Определение времени (в какую строку попадает блок)
-                # Блок попадает в строку, если его центр Y внутри строки
-                b_center_y = (by0 + by1) / 2
-                target_row = None
-                for tr in time_rows:
-                    if tr['y'] <= b_center_y <= tr['end_y']:
-                        target_row = tr
-                        break
+                # Ищем день недели слева
+                row_words_all = [w for w in words if row_top <= w['top'] < row_bottom]
+                left_words = [w for w in row_words_all if w['x1'] < data_left_boundary]
                 
-                if not target_row: continue
+                for lw in left_words:
+                    d_txt = lw['text'].lower()
+                    for dname in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
+                        if dname in d_txt: current_day = dname.capitalize()
 
-                # В. Определение группы (Колонки)
-                # Проверяем пересечение по X
-                for col in final_columns:
-                    # Логика пересечения:
-                    # 1. Блок целиком внутри колонки
-                    # 2. Блок (лекция) накрывает колонку более чем на 50% её ширины
+                # Время
+                time_str = t_slot['text'] # "8.30"
+                # Пытаемся найти конец пары (например "-9.50")
+                time_end_part = ""
+                for w in left_words:
+                    if w != t_slot and abs(w['top'] - t_slot['top']) < 15 and w['x0'] > t_slot['x0']:
+                        time_end_part = w['text']
+                
+                full_time = time_str + time_end_part
+                t_matches = TIME_PATTERN.findall(full_time)
+                t_start = t_matches[0].replace('.', ':') if len(t_matches) > 0 else ""
+                t_end = t_matches[1].replace('.', ':') if len(t_matches) > 1 else ""
+
+                # Разбор ячеек
+                for col in col_boundaries:
+                    # Слова внутри ячейки
+                    cell_words = []
+                    for w in row_words_all:
+                        w_center = (w['x0'] + w['x1']) / 2
+                        # Попадание в колонку
+                        if col['x0'] <= w_center < col['x1']:
+                            cell_words.append(w)
+                        # ЛЕКЦИЯ: Перекрытие границ
+                        elif w['x0'] < col['x0'] and w['x1'] > col['x1']:
+                            cell_words.append(w)
                     
-                    # Пересечение отрезков [bx0, bx1] и [col.x0, col.x1]
-                    overlap_start = max(bx0, col['x0'])
-                    overlap_end = min(bx1, col['x1'])
-                    overlap_len = max(0, overlap_end - overlap_start)
+                    if not cell_words: continue
                     
-                    col_width = col['x1'] - col['x0']
+                    # Собираем текст
+                    cell_words.sort(key=lambda w: (int(w['top']/5), w['x0']))
+                    text = " ".join([w['text'] for w in cell_words])
                     
-                    # Если блок внутри колонки ИЛИ блок перекрывает колонку (лекция)
-                    if overlap_len > 0:
-                        # Считаем это попаданием, если пересечение значительное (например, > 30% ширины блока находится здесь)
-                        # Или для лекций: если блок покрывает центр колонки
-                        col_center = (col['x0'] + col['x1']) / 2
-                        
-                        if (bx0 < col_center < bx1) or (overlap_len / (bx1 - bx0) > 0.5):
-                            # ЭТО НАША ПАРА
-                            # Парсим время
-                            times = re.findall(r'\d{1,2}[:.]\d{2}', target_row['text'])
-                            t_start = times[0].replace('.', ':') if len(times) > 0 else ""
-                            t_end = times[1].replace('.', ':') if len(times) > 1 else ""
-                            
-                            # Парсим текст
-                            lessons = _smart_parse(btext)
-                            
-                            key = f"Группа {col['name']}"
-                            if key not in schedule_by_group: schedule_by_group[key] = {}
-                            if current_day not in schedule_by_group[key]: schedule_by_group[key][current_day] = []
-                            
-                            # Добавляем (проверка на дубли)
-                            for l in lessons:
-                                l.time_start = t_start
-                                l.time_end = t_end
-                                exists = any(x.subject == l.subject and x.time_start == l.time_start for x in schedule_by_group[key][current_day])
-                                if not exists:
-                                    schedule_by_group[key][current_day].append(l)
+                    # Мусорный фильтр
+                    if len(text) < 4 or "с/к" in text.lower(): continue
+                    
+                    # Парсим
+                    lessons = _parse_cell_text(text)
+                    
+                    # Сохраняем
+                    g_key = f"Группа {col['name']}"
+                    if g_key not in schedule_by_group: schedule_by_group[g_key] = {}
+                    if current_day not in schedule_by_group[g_key]: schedule_by_group[g_key][current_day] = []
+                    
+                    for l in lessons:
+                        l.time_start = t_start
+                        l.time_end = t_end
+                        # Проверка дублей
+                        exists = any(x.subject == l.subject and x.time_start == l.time_start for x in schedule_by_group[g_key][current_day])
+                        if not exists:
+                            schedule_by_group[g_key][current_day].append(l)
 
     # Финал
     final = {}
-    d_order = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-    for g, days in schedule_by_group.items():
+    d_ord = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+    for g, d in schedule_by_group.items():
         week = []
-        for dname in sorted(days.keys(), key=lambda x: d_order.index(x) if x in d_order else 9):
-            week.append(DaySchedule(day_name=dname, lessons=days[dname]))
+        for dn in sorted(d.keys(), key=lambda x: d_ord.index(x) if x in d_ord else 9):
+            week.append(DaySchedule(day_name=dn, lessons=d[dn]))
         final[g] = week
         
     return ParsedScheduleResponse(groups=final)
 
-def _smart_parse(text: str) -> List[LessonItem]:
-    """Умный парсер PyMuPDF текста"""
-    # Удаляем лишние тире, которые возникают при переносе
-    text = text.replace("- ", "").strip()
+def _parse_cell_text(text: str) -> List[LessonItem]:
+    text = text.replace('\n', ' ').strip()
     
     # 1. Тип
     l_type = "Прак"
@@ -216,49 +218,34 @@ def _smart_parse(text: str) -> List[LessonItem]:
         elif "лаб" in v: l_type = "Лаба"
         text = text.replace(tm.group(0), "")
 
-    # 2. Ауд (обычно в конце)
+    # 2. Аудитория
     room = ""
-    rm = ROOM_PATTERN.findall(text)
+    rm = ROOM_PATTERN.search(text)
     if rm:
-        room = rm[-1] # Последнее похожее на аудиторию
-        # Удаляем его из текста
-        text = re.sub(re.escape(room), "", text)
+        room = rm.group(0)
+        text = text.replace(room, "")
 
-    # 3. Препод (ФИО)
+    # 3. Преподаватель (Жадный поиск ФИО)
     teacher = ""
+    # Ищем все совпадения
     ts = list(TEACHER_PATTERN.finditer(text))
     if ts:
-        # Берем последнего найденного (предмет обычно в начале)
+        # Обычно препод в конце строки
         t_match = ts[-1]
         teacher = t_match.group(0).strip()
-        # Вырезаем
-        text = text[:t_match.start()] + text[t_match.end():]
+        text = text[:t_match.start()] + text[t_match.end():] # Вырезаем
 
-    # 4. Предмет (Чистка)
-    # Удаляем мусор: лишние точки, запятые, тире
-    subj = re.sub(r'^[.,\s—-]+|[.,\s—-]+$', '', text).strip()
-    
-    # "Англ. 1" -> Предмет: Иностр, Подгруппа: Англ
-    subg = None
-    orig_lower = text.lower()
-    
-    if len(subj) < 4:
-        if "англ" in orig_lower: subj = "Иностранный язык"; subg = "Английский"
-        elif "нем" in orig_lower: subj = "Иностранный язык"; subg = "Немецкий"
-        elif "физ" in orig_lower: subj = "Физкультура"
+    # 4. Предмет
+    subj = text.replace("—", "").replace("-", "").strip(" .,")
+    if len(subj) < 3:
+        if "англ" in text.lower(): subj = "Иностранный язык"
+        elif "физ" in text.lower(): subj = "Физкультура"
         else: subj = "Занятие"
-    else:
-        # Если предмет длинный, проверим подгруппу внутри
-        if "англ" in orig_lower: subg = "Английский"
-        elif "нем" in orig_lower: subg = "Немецкий"
-        elif "фр" in orig_lower: subg = "Французский"
 
-    return [LessonItem(
-        subject=subj,
-        type=l_type,
-        teacher=teacher,
-        room=room,
-        time_start="",
-        time_end="",
-        subgroup=subg
-    )]
+    # Подгруппа
+    subg = None
+    if "англ" in text.lower(): subg = "Английский"
+    elif "нем" in text.lower(): subg = "Немецкий"
+    elif "фр" in text.lower(): subg = "Французский"
+    
+    return [LessonItem(subject=subj, type=l_type, teacher=teacher, room=room, time_start="", time_end="", subgroup=subg)]
