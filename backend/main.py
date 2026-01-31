@@ -54,9 +54,8 @@ SPECIALTY_MAP = {
     "менеджмент": "ITG_timetable.pdf"
 }
 
-# --- CACHE ---
+# --- КЕШИРОВАНИЕ ---
 CACHE_DIR = "schedule_cache"
-# Версия кеша v6 - чтобы точно сбросить весь мусор
 CACHE_VERSION = "v6" 
 if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
@@ -80,7 +79,7 @@ def save_to_cache(filename: str, data: ParsedScheduleResponse):
             f.write(data.json())
     except: pass
 
-# --- AUTO-REFRESH ---
+# --- ФОНОВОЕ ОБНОВЛЕНИЕ ---
 async def refresh_schedules_task():
     while True:
         logger.info(f"🔄 Auto-Refresh: {len(ACTIVE_SCHEDULES)} schedules")
@@ -102,6 +101,70 @@ async def refresh_schedules_task():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(refresh_schedules_task())
+
+# --- ПАРСЕР ОЦЕНОК (ТВОЙ КОД) ---
+
+def clean_text(text: Any) -> str:
+    """Удаляет лишние пробелы и неразрывные пробелы из текста."""
+    if not text: return ""
+    return re.sub(r'\s+', ' ', str(text).replace('\xa0', ' ').strip())
+
+def safe_get_attr(element: Any, attr: str) -> str:
+    """Безопасно получает атрибут тега (класс, id и т.д.)."""
+    if not element: return ""
+    val = element.get(attr)
+    if isinstance(val, list): return " ".join(val)
+    return str(val) if val else ""
+
+def parse_grade_row(cols: List[Any]) -> Dict[str, str]:
+    """Парсит строку таблицы успеваемости (Sexy version)."""
+    res = {"mark": "", "color_type": "neutral"}
+    exam_cell = None
+    credit_cell = None
+    
+    for c in cols:
+        cls = safe_get_attr(c, "class")
+        if "styleExamBody" in cls: exam_cell = c
+        if "styleZachBody" in cls: credit_cell = c
+    
+    # 1. Экзамены (Цифры)
+    if exam_cell:
+        raw_text = clean_text(exam_cell.get_text()) or safe_get_attr(exam_cell, "title")
+        if raw_text:
+            match = re.search(r'^(\d+)', raw_text)
+            if match:
+                res["mark"] = match.group(1)
+                try:
+                    val = int(res["mark"])
+                    if val < 4: res["color_type"] = "bad"
+                    elif val < 6: res["color_type"] = "bad"
+                    elif val < 7: res["color_type"] = "neutral"
+                    elif val < 9: res["color_type"] = "good"
+                    else: res["color_type"] = "excellent"
+                except ValueError: pass
+            else:
+                res["mark"] = raw_text[:15]
+                res["color_type"] = "bad"
+            return res
+
+    # 2. Зачеты (Текст)
+    if credit_cell:
+        raw_text = clean_text(credit_cell.get_text())
+        if raw_text:
+            text_lower = raw_text.lower()
+            if any(x in text_lower for x in ["зачтено", "+", "зачёт"]):
+                res["mark"] = "Зачет"
+                res["color_type"] = "good"
+            elif any(x in text_lower for x in ["не зачтено", "незач", "-"]):
+                res["mark"] = "Незач"
+                res["color_type"] = "bad"
+            else:
+                clean_mark = raw_text.split('(')[0].strip()
+                res["mark"] = clean_mark.capitalize()[:20]
+                res["color_type"] = "neutral"
+                if "осв" in text_lower:
+                    res["mark"] = "ОСВ"
+    return res
 
 # --- ENDPOINTS ---
 
@@ -131,16 +194,16 @@ def login(data: LoginRequest):
                 "ctl00$ContentPlaceHolder0$txtCapture": code,
                 "ctl00$ContentPlaceHolder0$btnLogon": "Войти"
             }
-            r2 = s.post("https://student.bsu.by/login.aspx", data=payload, headers=HEADERS, allow_redirects=False)
+            r2 = s.post("https://student.bsu.by/login.aspx", data=payload, headers=post_headers, allow_redirects=False)
             
             if r2.status_code == 302 or "Logout.aspx" in r2.text:
                 return {"status": "ok", "cookies": s.cookies.get_dict()}
         except Exception: time.sleep(1)
     raise HTTPException(401, "Login failed")
 
+# Эндпоинт для быстрой инфы (шапка приложения)
 @app.post("/user-info")
 def get_user_info(data: ScheduleRequest):
-    """Быстрый запрос информации о студенте (без PDF)"""
     s = requests.Session()
     s.proxies.update(PROXIES)
     s.cookies.update(data.cookies)
@@ -165,9 +228,84 @@ def get_user_info(data: ScheduleRequest):
         logger.error(f"UserInfo error: {e}")
         raise HTTPException(500, str(e))
 
+# Эндпоинт для ОЦЕНОК и НОВОСТЕЙ (Тот самый, который был 404)
+@app.post("/schedule")
+def get_grades_and_news(data: ScheduleRequest):
+    s = requests.Session()
+    s.proxies.update(PROXIES)
+    s.cookies.update(data.cookies)
+    
+    resp = {
+        "status": "ok",
+        "data": {
+            "subjects": [], 
+            "news": []
+        }
+    }
+    
+    try:
+        # 1. Забираем Оценки
+        url = "https://student.bsu.by/PersonalCabinet/StudProgress"
+        r = s.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        # Ищем таблицу с оценками
+        table = None
+        for t in soup.find_all("table"):
+            if "№ п/п" in t.text: table = t; break
+            
+        if table:
+            for row in table.find_all("tr"):
+                name_cell = row.find("td", class_=re.compile("styleLesson"))
+                if name_cell:
+                    nm = clean_text(name_cell.get_text(separator=" ")).replace("Дисциплины по выбору студента:", "").strip()
+                    if len(nm) < 3 or "предмет" in nm.lower(): continue
+                    
+                    cols = row.find_all("td")
+                    # ИСПОЛЬЗУЕМ ТВОЙ ПАРСЕР
+                    grade_data = parse_grade_row(cols)
+                    
+                    # Часы (лекции/практики)
+                    hm = {}
+                    titles = ["lectures", "practice", "labs", "seminars", "electives", "ksr"]
+                    ti = 0
+                    for c in cols:
+                        if "styleHours" in safe_get_attr(c, "class"):
+                            if ti < len(titles) and c.text.strip().isdigit(): 
+                                hm[titles[ti]] = int(c.text.strip())
+                            ti += 1
+
+                    resp["data"]["subjects"].append({
+                        "name": nm, 
+                        "hours": hm, 
+                        "mark": grade_data["mark"], 
+                        "color": grade_data["color_type"]
+                    })
+
+        # 2. Забираем Новости (бонус)
+        try:
+            rn = s.get("https://student.bsu.by/PersonalCabinet/News", headers=HEADERS)
+            sn = BeautifulSoup(rn.text, 'html.parser')
+            for a in sn.find_all("a"):
+                if "Подробнее" in a.get_text():
+                    p = a.parent
+                    if p:
+                        full = clean_text(p.text)
+                        dm = re.search(r'\d{2}\.\d{2}\.\d{4}', full)
+                        dt = dm.group(0) if dm else ""
+                        cnt = full.replace("Подробнее...", "").replace(dt, "").strip()
+                        if cnt: resp["data"]["news"].append({"date": dt, "title": cnt[:60]+"...", "content": cnt})
+        except: pass
+        
+        return resp
+
+    except Exception as e:
+        logger.error(f"Grades Error: {e}")
+        raise HTTPException(500, str(e))
+
+# Эндпоинт для PDF Расписания (OCR)
 @app.post("/schedule/parse", response_model=ParsedScheduleResponse)
 async def parse_schedule(data: ScheduleRequest):
-    """Тяжелый запрос (OCR)"""
     s = requests.Session()
     s.proxies.update(PROXIES)
     s.cookies.update(data.cookies)
@@ -199,11 +337,9 @@ async def parse_schedule(data: ScheduleRequest):
         ACTIVE_SCHEDULES.add((pdf_url, course))
         cache_file = get_cache_filename(pdf_url, course)
         
-        # 1. Кеш
         cached = load_from_cache(cache_file)
         if cached: return cached
 
-        # 2. Скачивание и OCR (фоном)
         logger.info(f"Downloading PDF: {pdf_url}")
         pdf_resp = s.get(pdf_url, headers=HEADERS, verify=False)
         
@@ -218,8 +354,9 @@ async def parse_schedule(data: ScheduleRequest):
         logger.error(f"Parse error: {e}")
         raise HTTPException(500, str(e))
 
-def clean_text(text):
-    return re.sub(r'\s+', ' ', str(text).replace('\xa0', ' ').strip())
+# Нужно для логина, если где-то используется напрямую
+post_headers = HEADERS.copy()
+post_headers.update({"Origin": "https://student.bsu.by", "Referer": "https://student.bsu.by/login.aspx"})
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
