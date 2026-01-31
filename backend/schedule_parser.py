@@ -1,270 +1,256 @@
 import pdfplumber
 import re
 import io
-from typing import List, Dict, Optional
+from typing import List, Dict, Any
 from models import ParsedScheduleResponse, DaySchedule, LessonItem
 
-# --- РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ (МАТЕМАТИКА ТЕКСТА) ---
+# --- КОНСТАНТЫ ---
+# Допуск по Y (в пикселях), чтобы считать, что текст на одной строке
+Y_TOLERANCE = 5 
+# Минимальная ширина текста, чтобы считать его "Лекцией на поток"
+LECTURE_WIDTH_THRESHOLD = 150 
 
-# Время: 8.30-9.50, 08:30 - 09:50
+# Регулярки
 TIME_PATTERN = re.compile(r'(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})')
-
-# Аудитория: 3-4 цифры, или "с/к", "с/з", "ауд."
-ROOM_PATTERN = re.compile(r'\b(\d{3,4}[а-я]?|с/к|с/з|ауд\.?)\b', re.IGNORECASE)
-
-# Тип занятия: (лек), (пр), (лаб), (сем)
-TYPE_PATTERN = re.compile(r'\((лек|прак|сем|лаб|кcр|зачет|экз.*?|ф|семинар)\)', re.IGNORECASE)
-
-# Преподаватель: Фамилия И.О. (с учетом двойных фамилий и отсутствия инициалов)
-# Ищем паттерн: Заглавная буква, строчные, пробел, Заглавная, точка, Заглавная, точка
-TEACHER_PATTERN = re.compile(r'([A-ЯЁ][а-яё]+(?:-[A-ЯЁ][а-яё]+)?\s+[A-ЯЁ]\.\s?[A-ЯЁ]\.)')
+# Ищем "Группа" или просто цифры, если они в шапке
+GROUP_HEADER_PATTERN = re.compile(r'(?:группа\s*)?(\d{2,3})', re.IGNORECASE)
 
 def parse_schedule_pdf(pdf_bytes: bytes, course: int) -> ParsedScheduleResponse:
-    print(f"🚀 [PLUMBER] Starting analysis. Size: {len(pdf_bytes)} bytes")
-    
+    print(f"📐 [GEOMETRY] Starting parsing... Size: {len(pdf_bytes)}")
     schedule_by_group: Dict[str, Dict[str, List[LessonItem]]] = {}
     
-    # Открываем PDF как объект
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # Выбираем страницы курса (обычно 2 страницы на курс)
-        start_page_idx = max(0, (course - 1) * 2)
-        # Берем с запасом 3 страницы, на случай смещения
-        pages = pdf.pages[start_page_idx : start_page_idx + 2]
+        start_page = max(0, (course - 1) * 2)
+        pages = pdf.pages[start_page : start_page + 2]
         
         for page_num, page in enumerate(pages):
-            print(f"📄 Analyzing Page {page_num + 1}...")
+            print(f"📄 Analyzing Page {page_num + 1} with Geometry...")
             
-            # Извлекаем таблицу с настройками для "грязных" PDF
-            # vertical_strategy="text" помогает найти колонки по выравниванию текста
-            tables = page.extract_tables({
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5
-            })
+            # 1. Извлекаем ВСЕ слова с координатами
+            # words = list of dicts: {'text':Str, 'x0':float, 'x1':float, 'top':float, 'bottom':float}
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=True)
             
-            for table in tables:
-                if not table or len(table) < 2: continue
-                
-                # --- ЭТАП 1: ПОИСК СТРУКТУРЫ (ЗАГОЛОВКИ) ---
-                header_row_idx = -1
-                group_map = {} # {column_index: "GroupName"}
-                day_col_idx = -1
-                time_col_idx = -1
-                
-                # Сканируем первые 5 строк, ищем "Часы" или "Время"
-                for r_idx, row in enumerate(table[:5]):
-                    row_text = " ".join([str(c).lower() for c in row if c])
-                    if "часы" in row_text or "время" in row_text:
-                        header_row_idx = r_idx
-                        break
-                
-                if header_row_idx == -1:
-                    print("⚠️ Header not found in table, skipping...")
-                    continue
-
-                # Анализируем найденную шапку
-                header = table[header_row_idx]
-                for c_idx, cell in enumerate(header):
-                    if not cell: continue
-                    txt = clean_str(cell).lower()
+            # 2. Ищем ЯКОРЯ ГРУПП (Коридоры X)
+            # Ищем слова "Группа" или номера групп в верхней части страницы (top < 150)
+            group_columns = [] # [{'name': '17', 'x0': 100, 'x1': 200}, ...]
+            
+            # Сортируем слова по Y, потом по X
+            words.sort(key=lambda w: (w['top'], w['x0']))
+            
+            # Анализ шапки (первые 20% слов)
+            header_words = [w for w in words if w['top'] < page.height * 0.2]
+            
+            # Пытаемся найти слово "Группа" и следующие за ним цифры
+            for w in header_words:
+                txt = w['text'].lower()
+                if "группа" in txt or (w['x0'] > 100 and w['text'].isdigit() and len(w['text'])==2):
+                    # Это потенциальная группа
+                    # Очищаем имя
+                    g_name = w['text'].replace("Группа", "").strip()
+                    if not g_name: continue # Пустое слово "Группа", ищем цифру рядом (сложно, упростим)
                     
-                    if "дни" in txt or "день" in txt:
-                        day_col_idx = c_idx
-                    elif "часы" in txt or "время" in txt:
-                        time_col_idx = c_idx
-                    elif "группа" in txt or ("специальность" not in txt and len(txt) > 1):
-                        # Это колонка группы!
-                        # Чистим имя: "Группа 17" -> "Группа 17"
-                        g_name = clean_str(cell)
-                        # Защита от мусора в шапке
-                        if len(g_name) < 20: 
-                            group_map[c_idx] = g_name
+                    # Если нашли цифру "17"
+                    if g_name.isdigit():
+                        # Определяем границы коридора. 
+                        # Предполагаем, что колонка идет от текущего x0 до следующей группы
+                        group_columns.append({
+                            'name': g_name,
+                            'x0': float(w['x0']) - 10, # Чуть расширяем влево
+                            'x1': float(w['x1']) + 50  # Временная правая граница
+                        })
 
-                # Fallback: Если время не нашли, но таблица широкая, считаем 2-ю колонку временем
-                if time_col_idx == -1 and len(header) > 2:
-                    time_col_idx = 1
+            # Уточняем правые границы коридоров
+            group_columns.sort(key=lambda g: g['x0'])
+            for i in range(len(group_columns) - 1):
+                # Правая граница текущей = левая граница следующей
+                group_columns[i]['x1'] = group_columns[i+1]['x0']
+            
+            # Последняя группа идет до конца страницы
+            if group_columns:
+                group_columns[-1]['x1'] = float(page.width)
+
+            print(f"   🏛️ Found Vertical Corridors: {[g['name'] for g in group_columns]}")
+            if not group_columns:
+                print("   ⚠️ No groups found via geometry. Skipping page.")
+                continue
+
+            # 3. Ищем УРОВНИ ВРЕМЕНИ (Ось Y)
+            time_rows = [] # [{'time': '8.30-9.50', 'top': 100, 'bottom': 120}]
+            
+            for w in words:
+                # Ищем паттерн времени в тексте
+                if TIME_PATTERN.search(w['text']):
+                    # Проверяем, не дубликат ли это (рядом по Y)
+                    is_duplicate = False
+                    for existing in time_rows:
+                        if abs(existing['top'] - w['top']) < 10:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        # Чистим время
+                        tm = TIME_PATTERN.search(w['text'])
+                        t_str = f"{tm.group(1).replace('.', ':')} - {tm.group(2).replace('.', ':')}"
+                        time_rows.append({
+                            'time': t_str,
+                            'top': float(w['top']),
+                            'bottom': float(w['bottom'])
+                        })
+            
+            # Сортируем по времени (сверху вниз)
+            time_rows.sort(key=lambda t: t['top'])
+            print(f"   ⏰ Found {len(time_rows)} time slots")
+
+            # 4. МАТРИЦА ПЕРЕСЕЧЕНИЙ (Mapping)
+            # Для каждого временного слота...
+            current_day = "Понедельник" # Дефолт
+            
+            for i, t_row in enumerate(time_rows):
+                # Определяем высоту строки: от текущего времени до следующего (или до конца)
+                row_top = t_row['top'] - 5
+                row_bottom = time_rows[i+1]['top'] - 5 if i < len(time_rows)-1 else page.height
                 
-                print(f"   📊 Structure Found: TimeCol={time_col_idx}, Groups={list(group_map.values())}")
-
-                # --- ЭТАП 2: ИТЕРАЦИЯ ПО СТРОКАМ ---
-                current_day = "Понедельник"
+                # Ищем день недели слева от времени (x < 100) внутри этой высоты
+                day_candidates = [w for w in words 
+                                  if w['x1'] < group_columns[0]['x0'] 
+                                  and w['top'] >= row_top - 20 # Чуть выше смотрим
+                                  and w['bottom'] <= row_bottom]
                 
-                for row in table[header_row_idx + 1:]:
-                    # 1. Определяем День (учитываем Merged Cells)
-                    if day_col_idx != -1:
-                        d_val = row[day_col_idx]
-                        if d_val and len(d_val.strip()) > 2:
-                            raw_day = clean_str(d_val).capitalize()
-                            if is_valid_day(raw_day):
-                                current_day = raw_day
-                    
-                    # 2. Определяем Время
-                    t_val = row[time_col_idx] if time_col_idx != -1 else None
-                    if not t_val: continue # Строка без времени — мусор или разделитель
-                    
-                    t_clean = clean_str(t_val)
-                    t_match = TIME_PATTERN.search(t_clean)
-                    if not t_match: continue
-                    
-                    t_start = t_match.group(1).replace('.', ':')
-                    t_end = t_match.group(2).replace('.', ':')
+                for dc in day_candidates:
+                    d_txt = dc['text'].lower()
+                    for day_name in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
+                        if day_name in d_txt:
+                            current_day = day_name.capitalize()
+                            break
 
-                    # 3. Парсим Группы (Flood Fill Logic)
-                    for col_idx in range(len(row)):
-                        # Пропускаем день и время
-                        if col_idx == day_col_idx or col_idx == time_col_idx: continue
+                # 5. СБОР УРОЖАЯ (Текст внутри ячеек)
+                # Ищем слова, которые попадают в этот Y-диапазон
+                row_words = [w for w in words if w['top'] >= row_top and w['top'] < row_bottom]
+                
+                # Распределяем слова по группам
+                for group in group_columns:
+                    # Слова, которые попадают в X-коридор этой группы
+                    g_words = []
+                    
+                    for w in row_words:
+                        # Центр слова
+                        w_center = (w['x0'] + w['x1']) / 2
+                        w_width = w['x1'] - w['x0']
                         
-                        # Если это известная колонка группы
-                        if col_idx in group_map:
-                            g_name = group_map[col_idx]
-                            cell_text = row[col_idx]
-                            
-                            # ЛОГИКА ОБЪЕДИНЕНИЯ (ЛЕКЦИИ)
-                            # Если ячейка пустая, проверяем соседей слева.
-                            # Если слева есть "Лекция", которая явно широкая, берем её.
-                            # В pdfplumber merged cells часто возвращают None для "перекрытых" ячеек.
-                            final_text = cell_text
-                            
-                            if not final_text:
-                                # Ищем непустую ячейку слева в этой же строке, начиная от времени
-                                for scan_i in range(col_idx - 1, time_col_idx, -1):
-                                    neighbor = row[scan_i]
-                                    if neighbor and len(neighbor) > 5:
-                                        # Проверяем, похоже ли это на лекцию (обычно лекции объединяют потоки)
-                                        if "(лек)" in neighbor.lower() or "лек." in neighbor.lower():
-                                            final_text = neighbor
-                                        break
-                            
-                            if not final_text or len(final_text.strip()) < 3: continue
+                        # Логика 1: Слово строго внутри колонки
+                        is_inside = (w_center >= group['x0'] and w_center < group['x1'])
+                        
+                        # Логика 2 (ЛЕКЦИЯ): Слово очень широкое и накрывает колонку
+                        # Если ширина слова > 80% ширины колонки и оно пересекает её
+                        is_wide_lecture = False
+                        if w_width > (group['x1'] - group['x0']) * 0.8:
+                            # Проверяем пересечение отрезков [wx0, wx1] и [gx0, gx1]
+                            overlap = max(0, min(w['x1'], group['x1']) - max(w['x0'], group['x0']))
+                            if overlap > 20: # Если пересечение существенное
+                                is_wide_lecture = True
+                        
+                        if is_inside or is_wide_lecture:
+                            g_words.append(w)
+                    
+                    if not g_words: continue
+                    
+                    # Собираем текст из слов (сортируем по Y, потом по X)
+                    g_words.sort(key=lambda w: (w['top'] // 5, w['x0'])) # Группируем по строкам (допуск 5px)
+                    
+                    full_text = _assemble_text(g_words)
+                    
+                    # Если мусор - пропускаем
+                    if len(full_text) < 4 or "с/к" in full_text.lower(): continue
+                    
+                    # Парсим детали
+                    lessons = _smart_parse_text(full_text)
+                    
+                    # Сохраняем
+                    g_key = f"Группа {group['name']}"
+                    if g_key not in schedule_by_group: schedule_by_group[g_key] = {}
+                    if current_day not in schedule_by_group[g_key]: schedule_by_group[g_key][current_day] = []
+                    
+                    for l in lessons:
+                        l.time_start = t_row['time'].split(' - ')[0]
+                        l.time_end = t_row['time'].split(' - ')[1]
+                        schedule_by_group[g_key][current_day].append(l)
 
-                            # Парсим содержимое ячейки
-                            lessons = parse_cell_content(final_text)
-                            
-                            # Сохраняем
-                            if g_name not in schedule_by_group: schedule_by_group[g_name] = {}
-                            if current_day not in schedule_by_group[g_name]: schedule_by_group[g_name][current_day] = []
-                            
-                            for l in lessons:
-                                l.time_start = t_start
-                                l.time_end = t_end
-                                schedule_by_group[g_name][current_day].append(l)
-
-    # --- ЭТАП 3: СБОРКА И СОРТИРОВКА ---
+    # Финальная сборка
     final_output = {}
-    day_order = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+    days_order = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
     
-    for g_name, days_dict in schedule_by_group.items():
-        week_schedule = []
-        # Сортируем дни недели
-        sorted_days = sorted(days_dict.items(), key=lambda x: day_order.index(x[0]) if x[0] in day_order else 10)
-        
+    for g_name, days in schedule_by_group.items():
+        week = []
+        sorted_days = sorted(days.items(), key=lambda x: days_order.index(x[0]) if x[0] in days_order else 9)
         for d_name, lessons in sorted_days:
-            week_schedule.append(DaySchedule(day_name=d_name, lessons=lessons))
-        
-        final_output[g_name] = week_schedule
+            week.append(DaySchedule(day_name=d_name, lessons=lessons))
+        final_output[g_name] = week
 
-    print(f"✅ Parsing complete. Groups found: {list(final_output.keys())}")
+    print(f"✅ [GEOMETRY] Done. Groups: {list(final_output.keys())}")
     return ParsedScheduleResponse(groups=final_output)
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def _assemble_text(words: List[Dict]) -> str:
+    """Собирает слова в предложения, учитывая отступы"""
+    if not words: return ""
+    lines = []
+    current_line = [words[0]['text']]
+    last_top = words[0]['top']
+    
+    for w in words[1:]:
+        if abs(w['top'] - last_top) > 8: # Новая строка визуально
+            lines.append(" ".join(current_line))
+            current_line = []
+            last_top = w['top']
+        current_line.append(w['text'])
+    
+    lines.append(" ".join(current_line))
+    return " ".join(lines)
 
-def clean_str(s: str) -> str:
-    if not s: return ""
-    return s.replace('\n', ' ').strip()
-
-def is_valid_day(s: str) -> bool:
-    return any(d in s.lower() for d in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'])
-
-def parse_cell_content(text: str) -> List[LessonItem]:
+def _smart_parse_text(text: str) -> List[LessonItem]:
     """
-    Умный парсер содержимого ячейки.
-    Разделяет предметы, если их несколько (например, по разным неделям или подгруппам).
+    Умный парсер строки: [Тип] [Предмет] [Препод] [Ауд]
     """
-    text = clean_str(text)
+    # 1. Тип занятия
+    l_type = "Прак"
+    if "(лек)" in text.lower() or "лек." in text.lower(): l_type = "Лекция"
+    elif "(сем)" in text.lower(): l_type = "Семинар"
+    elif "(лаб)" in text.lower(): l_type = "Лаба"
     
-    # 1. Если есть явное разделение " / " или "Числитель/Знаменатель" (сложно, пока берем просто текст)
-    # Попробуем найти всех преподавателей, чтобы разбить строку
-    
-    teachers_matches = list(TEACHER_PATTERN.finditer(text))
-    
-    # Если преподов нет или один — считаем это одним предметом
-    if len(teachers_matches) <= 1:
-        return [extract_lesson_details(text)]
-    
-    # Если преподов много, пытаемся разбить строку
-    results = []
-    # Эвристика: разбиваем по началу совпадения следующего преподавателя, 
-    # но нужно найти начало ПРЕДМЕТА перед ним. Это сложно.
-    # Упрощение: разбиваем строку пополам, если 2 препода. 
-    # Но надежнее: просто вернуть всё как один предмет, но с длинным описанием.
-    # Попробуем разделить по подгруппам (например "1. Англ... 2. Англ...")
-    
-    if "1." in text and "2." in text:
-        # Попытка разбить по нумерации подгрупп
-        parts = re.split(r'\b\d\.', text)
-        for part in parts:
-            if len(part) > 3:
-                results.append(extract_lesson_details(part))
-        if results: return results
-
-    return [extract_lesson_details(text)]
-
-def extract_lesson_details(raw_text: str) -> LessonItem:
-    """
-    Метод ВЫЧИТАНИЯ: Находим известное (ауд, тип, препод), удаляем, остаток — это предмет.
-    """
-    text = raw_text.strip()
-    
-    # 1. Вырезаем Тип занятия
-    l_type = "Прак" # Дефолт
-    type_match = TYPE_PATTERN.search(text)
-    if type_match:
-        val = type_match.group(1).lower()
-        if "лек" in val: l_type = "Лекция"
-        elif "сем" in val: l_type = "Семинар"
-        elif "лаб" in val: l_type = "Лаба"
-        elif "экз" in val: l_type = "Экзамен"
-        elif "ф" in val: l_type = "Факультатив"
-        # Удаляем из текста
-        text = text.replace(type_match.group(0), " ")
-
-    # 2. Вырезаем Аудиторию (обычно в конце или после типа)
+    # 2. Аудитория (цифры в конце или с/к)
     room = ""
-    room_match = ROOM_PATTERN.search(text)
+    # Ищем 3-4 цифры, возможно с буквой, стоящие отдельно
+    room_match = re.search(r'\b(\d{3,4}[а-я]?|с/к)\b', text, re.IGNORECASE)
     if room_match:
         room = room_match.group(1)
-        text = text.replace(room, " ")
-
-    # 3. Вырезаем Преподавателя
+        text = text.replace(room, "") # Вырезаем
+    
+    # 3. Преподаватель (Фамилия И.О.)
     teacher = ""
-    teach_match = TEACHER_PATTERN.search(text)
+    # Паттерн: Заглавная + строчные + пробел + Заглавная. + Заглавная.
+    teach_match = re.search(r'([A-ЯЁ][а-яё]+\s+[A-ЯЁ]\.\s?[A-ЯЁ]\.)', text)
     if teach_match:
         teacher = teach_match.group(1)
-        text = text.replace(teacher, " ")
+        text = text.replace(teacher, "") # Вырезаем
+        
+    # 4. Предмет (всё что осталось)
+    # Удаляем мусорные слова
+    text = re.sub(r'\(.*?\)', '', text) # Удаляем все в скобках (типы)
+    text = text.replace("—", "").replace("-", "").strip()
+    subject = re.sub(r'\s+', ' ', text).strip()
     
-    # 4. Все что осталось — это Предмет
-    # Чистим от мусора (тире, точки, лишние пробелы)
-    subject = re.sub(r'\s+', ' ', text).strip(" .,-–")
+    if len(subject) < 3: subject = "Занятие"
     
-    # Хак: Если предмет слишком короткий, возможно это "Иностр. язык"
-    if len(subject) < 2 and "англ" in raw_text.lower(): subject = "Иностранный язык"
-    if not subject: subject = "Занятие"
-
-    # 5. Определение подгруппы
+    # Подгруппа
     subgroup = None
-    lower_raw = raw_text.lower()
-    if "англ" in lower_raw: subgroup = "Английский"
-    elif "нем" in lower_raw: subgroup = "Немецкий"
-    elif "фр" in lower_raw: subgroup = "Французский"
-    elif "кит" in lower_raw: subgroup = "Китайский"
-    elif "исп" in lower_raw: subgroup = "Испанский"
+    if "англ" in subject.lower(): subgroup = "Английский"
+    elif "нем" in subject.lower(): subgroup = "Немецкий"
     
-    return LessonItem(
+    return [LessonItem(
         subject=subject,
         type=l_type,
-        teacher=teacher.strip(),
-        room=room.strip(),
-        time_start="", # Будет заполнено выше
+        teacher=teacher,
+        room=room,
+        time_start="",
         time_end="",
         subgroup=subgroup
-    )
+    )]
