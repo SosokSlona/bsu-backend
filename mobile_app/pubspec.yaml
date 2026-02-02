@@ -10,6 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
   http: ^1.2.0
+  html: ^0.15.4            # Парсинг HTML (для логина BSU)
+  syncfusion_flutter_pdf: ^24.1.41 # Мощный PDF движок
   shared_preferences: ^2.2.2
 
 dev_dependencies:
